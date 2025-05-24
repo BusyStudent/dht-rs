@@ -2,7 +2,7 @@ use std::ops::{BitXor, Index, IndexMut};
 
 /// The NodeId of the DHT, 160 bits
 /// 
-#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(PartialOrd, Ord, PartialEq, Eq, Debug, Clone, Copy)]
 pub struct NodeId {
     pub data: [u8; 20],
 }
@@ -73,6 +73,38 @@ impl NodeId {
     /// Get the mut slice of the id's data
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         return self.data.as_mut_slice();
+    }
+
+    // Let self cast into vector
+    pub fn to_vec(&self) -> Vec<u8> {
+        return Vec::from(self.as_slice());
+    }
+}
+
+impl From<[u8; 20]> for NodeId {
+    fn from(value: [u8; 20]) -> Self {
+        return NodeId::new(value);
+    }
+}
+
+impl TryFrom<&[u8]> for NodeId {
+    type Error = ();
+    
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        if value.len() != 20 {
+            return Err(());
+        }
+        let mut arr = [0u8; 20];
+        arr.copy_from_slice(value);
+        return Ok(NodeId::new(arr));
+    }
+}
+
+impl TryFrom<&Vec<u8> > for NodeId {
+    type Error = ();
+    fn try_from(value: &Vec<u8>) -> Result<Self, Self::Error> {
+        let id = value.as_slice().try_into()?;
+        return Ok(id);
     }
 }
 

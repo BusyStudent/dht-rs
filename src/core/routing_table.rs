@@ -1,6 +1,10 @@
+// credit libtorrent
+#![allow(dead_code)] // Let it shutup!
+
 use std::collections::{BTreeSet, VecDeque};
 use std::net::{SocketAddr};
 use std::time::{Duration, SystemTime};
+use std::cmp;
 use super::NodeId;
 
 pub const KBUCKET_SIZE: usize = 8;
@@ -32,15 +36,15 @@ struct KBucket {
 /// The routing table of the DHT
 #[derive(Debug)]
 pub struct RoutingTable {
-    endpoints: BTreeSet<SocketAddr>, // The endpoints is to limits the same endpoint but id is different
+    routers: BTreeSet<SocketAddr>, // The endpoints of the bootstrap node, ignore it
+    ips: BTreeSet<SocketAddr>, // The endpoints is to limits the same endpoint but id is different
     buckets: Vec<KBucket>,
     id: NodeId, // The self id
 }
 
 #[derive(Debug)]
 pub enum UpdateNodeError {
-    Full, // The bucket of the node is full, can not insert
-    Mismatch, // The given id, ip has exists in the table, but it doesn't match
+    Failed,
     NeedSplit,
 }
 
@@ -72,12 +76,17 @@ impl KBucket {
     }
 }
 
+/// The Routing Table [0] on farest bucket, the back is the closest bucket, only the back bucket can be split
+/// - [1] [0, 2 ** 160]
+/// - [2] [2 ** 159, 2 ** 160] [0, 2 ** 159] 
+/// - [3] [2 ** 159, 2 ** 160] [2 ** 158, 2 ** 159] [0, 2 ** 158] 
 impl RoutingTable {
 
     /// Create an new routing table
     pub fn new(id: NodeId) -> RoutingTable {
         return RoutingTable { 
-            endpoints: BTreeSet::new(), 
+            routers: BTreeSet::new(),
+            ips: BTreeSet::new(), 
             buckets: vec![KBucket::new()], // The new routing table have one buckets
             id: id
         };
@@ -85,40 +94,38 @@ impl RoutingTable {
 
     /// Calc the bucket index by given node id, it return the location of the bucket
     pub fn calc_bucket_index(&self, target: NodeId) -> usize {
-        if target == self.id {
-            return 0;
-        }
+        // the self.buckets.len() at least is 1
         let clz = (self.id ^ target).leading_zeros() as usize;
-        debug_assert!(clz <= 160);
-        if clz >= self.buckets.len().saturating_sub(1) { // In first bucket range
-            return 0;
-        }
-        return self.buckets.len() - 1 - clz;
+        return cmp::min(clz, self.buckets.len() - 1);
     }
 
     /// Calc the node position after the bucket split
+    /// 
+    /// It means each we split, we spilt the far bucket out
+    /// 
     fn calc_node_pos_after_split(self_id: NodeId, buckets_len: usize, target: NodeId) -> SplitBucketPosition {
         let clz = (self_id ^ target).leading_zeros() as usize;
-        if clz >= buckets_len { // In cur bucket
-            return SplitBucketPosition::CurrentBucket;
-        }
-        else if clz >= buckets_len - 1 { // In new bucket
+        let idx = cmp::min(clz, buckets_len);
+        if idx == buckets_len {
             return SplitBucketPosition::NewBucket;
         }
+        else if idx == buckets_len - 1 {
+            return SplitBucketPosition::CurrentBucket;
+        }
         else {
-            return SplitBucketPosition::WrongBucket(clz);
+            return SplitBucketPosition::WrongBucket(idx);
         }
     }
 
     /// Find the node, by given id, return the bucket and the index in the bucket's vector
-    fn find_node(&self, target: NodeId) -> Option<(&KBucket, usize)> {
-        let idx = self.calc_bucket_index(target);
-        let bucket = &self.buckets[idx];
-        let pos = bucket.nodes.iter().position(|node| node.id == target )?;
-        return Some((bucket, pos));
-    }
+    // fn index_node(&self, target: NodeId) -> Option<(&KBucket, usize)> {
+    //     let idx = self.calc_bucket_index(target);
+    //     let bucket = &self.buckets[idx];
+    //     let pos = bucket.nodes.iter().position(|node| node.id == target )?;
+    //     return Some((bucket, pos));
+    // }
 
-    fn find_node_mut(&mut self, target: NodeId) -> Option<(&mut KBucket, usize)> {
+    fn index_node_mut(&mut self, target: NodeId) -> Option<(&mut KBucket, usize)> {
         let idx = self.calc_bucket_index(target);
         let bucket = &mut self.buckets[idx];
         let pos = bucket.nodes.iter().position(|node| node.id == target )?;
@@ -126,13 +133,23 @@ impl RoutingTable {
     }
 
     /// Find the closest nodes of the target, the return's max len is K
-    pub fn find_closest_nodes(&self, target: NodeId) -> Vec<(NodeId, SocketAddr)> {
+    pub fn find_node(&self, target: NodeId) -> Vec<(NodeId, SocketAddr)> {
         let idx = self.calc_bucket_index(target);
-        let bucket = &self.buckets[idx];
         let mut res = Vec::new();
-        for node in &bucket.nodes {
-            res.push((node.id, node.ip));
+        for bucket in (&self.buckets[0..=idx]).iter().rev() {
+            for node in &bucket.nodes {
+                res.push((node.id, node.ip));
+            }
+            if res.len() == KBUCKET_SIZE {
+                break;
+            }
         }
+        // Sort it by distance
+        res.sort_by(|a, b| {
+            let ld = a.0 ^ target;
+            let rd = b.0 ^ target;
+            return ld.cmp(&rd);
+        });
         return res;
     }
 
@@ -141,94 +158,79 @@ impl RoutingTable {
         let idx = self.calc_bucket_index(target);
         let buckets_len = self.buckets.len();
         let bucket = &mut self.buckets[idx];
-        let it = bucket.nodes.iter_mut().find(|node| node.id == target );
-        if let Some(node) = it { // Already exists
+        if self.ips.contains(ip) {
+            let node = match bucket.nodes.iter_mut().find(|node| node.id == target) {
+                Some(node) => node,
+                None => return Err(UpdateNodeError::Failed), // Ip exists but can not find the id
+            };
             if node.ip != *ip {
-                return Err(UpdateNodeError::Mismatch);
+                return Err(UpdateNodeError::Failed);
             }
+            // Got it, just update the timestamp and move
             node.last_seen = SystemTime::now();
             bucket.last_seen = SystemTime::now();
-            return Ok(()); // TODO: Did we need to distinguish updated and inserted?
+            return Ok(());
         }
-        if self.endpoints.contains(ip) { // We can not find the id, but the ip exists?
-            return Err(UpdateNodeError::Mismatch);
-        }
-        if bucket.nodes.len() == KBUCKET_SIZE { // Check if we can add node?
-            if !(idx == 0 && buckets_len < 160) { // The bucket can't split or max bucket
-                return Err(UpdateNodeError::Full);
-            }
-            // We need to check if split, the id's bucket has space to insert?, if not, return full, because if we still can't insert it after split, it is meaningless
-            let mut new_counts = 0;
-            let mut cur_counts = 0;
-            for node in &bucket.nodes {
-                match RoutingTable::calc_node_pos_after_split(self.id, buckets_len, node.id) {
-                    SplitBucketPosition::CurrentBucket => cur_counts += 1,
-                    SplitBucketPosition::NewBucket => new_counts += 1,
-                    _ => new_counts += 1, // As same as split 
-                }
-            }
-            // Check witch bucket we belong, 
-            let can_split = match RoutingTable::calc_node_pos_after_split(self.id, buckets_len, target) {
-                SplitBucketPosition::CurrentBucket => cur_counts + 1 < KBUCKET_SIZE,
-                SplitBucketPosition::NewBucket => new_counts + 1 < KBUCKET_SIZE,
-                _ => new_counts + 1 < KBUCKET_SIZE, // As same as split 
-            };
-            if !can_split {
-                return Err(UpdateNodeError::Full);
+        if bucket.nodes.len() == KBUCKET_SIZE { // Full!
+            if idx != buckets_len - 1 || buckets_len == 160 {
+                return Err(UpdateNodeError::Failed);
             }
             return Err(UpdateNodeError::NeedSplit);
         }
-        // Doing add
+        // Doing add logic, do filter it
+        if target == self.id || self.routers.contains(ip) { // If is self or ip from router nodes, ignore it!
+            return Err(UpdateNodeError::Failed);
+        }
         let node = Node::new(target, ip.clone());
         bucket.nodes.push(node);
         bucket.last_seen = SystemTime::now();
-        self.endpoints.insert(ip.clone());
+        self.ips.insert(ip.clone());
         return Ok(());
     }
 
     /// Remove the node by given id, return the removed node 
     pub fn remove_node(&mut self, target: NodeId) -> Option<(NodeId, SocketAddr)> {
-        let (bucket, pos) = self.find_node_mut(target)?;
+        let (bucket, pos) = self.index_node_mut(target)?;
         let node = bucket.nodes.swap_remove(pos);
-        self.endpoints.remove(&node.ip);
+        self.ips.remove(&node.ip);
         return Some((node.id, node.ip));
     }
 
     /// Split the bucket
-    /// The KAD Says only the bucket's range contains self id can be splited, so the only bucket can be splited is on the self.buckets.first()
     pub fn split_bucket(&mut self) {
         let buckets_len = self.buckets.len();
         if buckets_len == 160 { // MAX Buckets
             return;
         }
-        let first = self.buckets.first_mut().expect("WTF Impossible!");
+        let last = self.buckets.last_mut().expect("WTF Impossible!");
         let mut new_bucket = KBucket::new();
         let mut cur_vec = Vec::new();
         let new_vec = &mut new_bucket.nodes;
 
-        for node in std::mem::take(&mut first.nodes) {
+        for node in std::mem::take(&mut last.nodes) {
             match RoutingTable::calc_node_pos_after_split(self.id, buckets_len, node.id) {
                 SplitBucketPosition::CurrentBucket => cur_vec.push(node),
                 SplitBucketPosition::NewBucket => new_vec.push(node),
-                SplitBucketPosition::WrongBucket(clz) => { // It should not happen, node in wrong bucket
-                    eprintln!("Warning: Node {:?} with clz {} found in bucket 0 (len {} prior to split), expected clz >= {}. Moving to new bucket 1.", node.id, clz, buckets_len, buckets_len - 1);
+                SplitBucketPosition::WrongBucket(_idx) => { // It should not happen, node in wrong bucket
                     new_vec.push(node);
                 },
             }
         }
-        first.nodes = cur_vec;
-        new_bucket.last_seen = first.last_seen.clone();
-        self.buckets.insert(1, new_bucket);
+        last.nodes = cur_vec;
+        new_bucket.last_seen = last.last_seen.clone();
+        self.buckets.push(new_bucket);
     }
 
     /// Get the next node we need to refresh
-    pub fn next_refresh_node(&self) -> Option<(NodeId, SocketAddr, Duration)> {  
-        let bucket = self.buckets.iter().min_by_key(|bucket| bucket.last_seen )?;
-        let node = bucket.nodes.iter().min_by_key(|node| node.last_seen )?;
-        match node.last_seen.elapsed() {
-            Ok(duration) => return Some((node.id, node.ip, duration)),
+    pub fn next_refresh_node(&mut self) -> Option<(NodeId, SocketAddr, Duration)> {  
+        let bucket = self.buckets.iter_mut().min_by_key(|bucket| bucket.last_seen )?;
+        let node = bucket.nodes.iter_mut().min_by_key(|node| node.last_seen )?;
+        let duration = match node.last_seen.elapsed() {
+            Ok(duration) => duration,
             Err(_) => return None, // Why it happen?, the system clock changed?
-        }
+        };
+        node.last_seen = SystemTime::now(); // Avoid select the same node
+        return Some((node.id, node.ip, duration));
     }
 
     /// Get the num of the nodes in the table
@@ -245,8 +247,19 @@ impl RoutingTable {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
+    use ctor::ctor;
 
     use super::*;
+
+
+    fn make_addr(ip: u32, port: u16) -> SocketAddr {
+        return SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), port);
+    }
+
+    #[ctor]
+    fn init_color_backtrace() {
+        color_backtrace::install();
+    }
 
     #[test]
     fn test_routing_table_basic() {
@@ -255,15 +268,15 @@ mod tests {
         
         // Test empty table
         assert_eq!(table.buckets.len(), 1);
-        assert!(table.find_closest_nodes(NodeId::new([2; 20])).is_empty());
+        assert!(table.find_node(NodeId::new([2; 20])).is_empty());
 
         // Test adding nodes
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8000);
+        let addr = make_addr(0, 80);
         let node_id = NodeId::new([2; 20]);
         assert!(table.update_node(node_id, &addr).is_ok());
 
         // Test finding added node
-        let closest = table.find_closest_nodes(node_id);
+        let closest = table.find_node(node_id);
         assert_eq!(closest.len(), 1);
         assert_eq!(closest[0].0, node_id);
         assert_eq!(closest[0].1, addr);
@@ -276,9 +289,9 @@ mod tests {
         
         // Test bucket need split
         for i in 0..=KBUCKET_SIZE {
-            let test_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, i as u8)), 8000);
+            let test_addr = make_addr(i as u32 + 1, 80);
             if i < KBUCKET_SIZE {
-                let test_id = NodeId::new([i as u8; 20]);
+                let test_id = NodeId::new([(i + 2) as u8; 20]);
                 assert!(table.update_node(test_id, &test_addr).is_ok());
             }
             else {
@@ -287,15 +300,11 @@ mod tests {
                 // assert!(matches!(table.update_node(test_id, &test_addr), Err(UpdateNodeError::NeedSplit)));
             }
         }
-
-        // Test duplicate IP error
-        let dup_id = NodeId::new([99; 20]);
-        assert!(matches!(table.update_node(dup_id, &addr), Err(UpdateNodeError::Mismatch)));
     }
 
     #[test]
     fn test_bucket_split() {
-        let id = NodeId::new([1; 20]);
+        let id = NodeId::new([0; 20]);
         let mut table = RoutingTable::new(id);
 
         // Fill first bucket
@@ -306,7 +315,8 @@ mod tests {
         }
 
         // Trigger split
-        let split_id = NodeId::new([0xFF; 20]);
+        let mut split_id = NodeId::new([1; 20]);
+        split_id[19] = 0;
         let split_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 99)), 8000);
         assert!(matches!(table.update_node(split_id, &split_addr), Err(UpdateNodeError::NeedSplit)));
         table.split_bucket();

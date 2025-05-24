@@ -180,6 +180,36 @@ impl Object {
     }
 }
 
+impl From<i64> for Object {
+    fn from(item: i64) -> Self {
+        return Object::Int(item);
+    }
+}
+
+impl From<&[u8]> for Object {
+    fn from(item: &[u8]) -> Self {
+        return Object::String(item.to_vec());
+    }
+}
+
+impl From<Vec<u8> > for Object {
+    fn from(item: Vec<u8>) -> Self {
+        return Object::String(item);
+    }
+}
+
+impl From<Vec<Object> > for Object {
+    fn from(item: Vec<Object>) -> Self {
+        return Object::List(item);
+    }
+}
+
+impl From<BTreeMap<Vec<u8>, Object> > for Object {
+    fn from(item: BTreeMap<Vec<u8>, Object>) -> Self {
+        return Object::Dict(item);
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
