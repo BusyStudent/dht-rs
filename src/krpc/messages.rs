@@ -8,44 +8,46 @@ pub trait Message {
     fn from_bencode(obj: &Object) -> Option<Self> where Self: Sized;
 }
 
-pub trait Query : Message {
-
+pub trait KrpcQuery {
+    type Reply: Message;
+    
+    fn method_name() -> &'static [u8];
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct FindNodeQuery {
-    id: NodeId, // Which node send this query?
-    target: NodeId, // The target node id want to find
+    pub id: NodeId, // Which node send this query?
+    pub target: NodeId, // The target node id want to find
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct FindNodeReply {
-    id: NodeId,
-    nodes: Vec<(NodeId, SocketAddr)>,
+    pub id: NodeId,
+    pub nodes: Vec<(NodeId, SocketAddr)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PingQuery {
-    id: NodeId,
+    pub id: NodeId,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PingReply {
-    id: NodeId,
+    pub id: NodeId,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct GetPeersQuery {
-    id: NodeId,
-    info_hash: InfoHash,
+    pub id: NodeId,
+    pub info_hash: InfoHash,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct GetPeersReply {
-    id: NodeId,
-    token: Vec<u8>,
-    nodes: Vec<(NodeId, SocketAddr)>,
-    values: Vec<SocketAddr>,
+    pub id: NodeId,
+    pub token: Vec<u8>,
+    pub nodes: Vec<(NodeId, SocketAddr)>,
+    pub values: Vec<SocketAddr>,
 }
 
 fn parse_node_id(id: &Vec<u8>) -> Option<NodeId> {
@@ -250,6 +252,14 @@ impl Message for PingQuery {
         return Some(Self {
             id: parse_node_id(id)?,
         });
+    }
+}
+
+impl KrpcQuery for PingQuery {
+    type Reply = PingReply;
+
+    fn method_name() -> &'static [u8] {
+        return b"ping".as_slice();
     }
 }
 

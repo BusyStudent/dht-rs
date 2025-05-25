@@ -8,3 +8,4 @@ tokio = { version = "1", features = ["full"] }
 fastrand = { version = "2" }
 color-backtrace = { version = "0.7" }
 ctor = "0.4.2"
+thiserror = "2.0.12"

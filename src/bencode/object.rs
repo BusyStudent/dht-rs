@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-#[derive(PartialEq, Eq, Debug)]
+#[derive(PartialEq, Eq, Debug, Clone)]
 pub enum Object {
     Int(i64),
     String(Vec<u8>),
