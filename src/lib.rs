@@ -1,6 +1,7 @@
 pub mod bencode;
 pub mod core;
 pub mod krpc;
+pub mod dht;
 pub use core::NodeId;
 pub use core::InfoHash;
 

@@ -8,9 +8,15 @@ pub trait Message {
     fn from_bencode(obj: &Object) -> Option<Self> where Self: Sized;
 }
 
-pub trait KrpcQuery {
-    type Reply: Message;
+pub trait KrpcReply : Message {
     
+}
+
+pub trait KrpcQuery : Message {
+    type Reply: KrpcReply;
+
+    /// The method name of the query, raw string used in krpc
+    /// e.g. "find_node", "get_peers", "ping"
     fn method_name() -> &'static [u8];
 }
 
@@ -48,6 +54,41 @@ pub struct GetPeersReply {
     pub token: Vec<u8>,
     pub nodes: Vec<(NodeId, SocketAddr)>,
     pub values: Vec<SocketAddr>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AnnouncePeerQuery {
+    pub id: NodeId,
+    pub info_hash: InfoHash,
+    pub port: u16,
+    pub token: Vec<u8>,
+    pub implied_port: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AnnouncePeerReply {
+    pub id: NodeId,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SampleInfoHashesQuery {
+    pub id: NodeId,
+    pub target: InfoHash,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SampleInfoHashesReply {
+    pub id: NodeId,
+    pub interval: u32, // The interval in seconds
+    pub nodes: Vec<(NodeId, SocketAddr)>,
+    pub num: u32, // The number of info in storage
+    pub info_hashes: Vec<InfoHash>, // The subset info hashes
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ErrorReply {
+    pub code: i64,
+    pub msg: String,
 }
 
 fn parse_node_id(id: &Vec<u8>) -> Option<NodeId> {
@@ -195,6 +236,14 @@ impl Message for FindNodeQuery {
     }
 }
 
+impl KrpcQuery for FindNodeQuery {
+    type Reply = FindNodeReply;
+
+    fn method_name() -> &'static [u8] {
+        return b"find_node".as_slice();
+    }
+}
+
 impl Message for FindNodeReply {
     fn to_bencode(&self) -> Object {
         // {"id" : "<querying nodes id>", "nodes" : "<compressed nodes>"} ipv4 format
@@ -233,6 +282,10 @@ impl Message for FindNodeReply {
             nodes: parse_nodes(nodes)?,
         });
     }
+}
+
+impl KrpcReply for FindNodeReply {
+
 }
 
 /// Ping...
@@ -282,6 +335,10 @@ impl Message for PingReply {
     }
 }
 
+impl KrpcReply for PingReply {
+
+}
+
 /// GetPeers...
 impl Message for GetPeersQuery {
     fn to_bencode(&self) -> Object {
@@ -302,6 +359,14 @@ impl Message for GetPeersQuery {
             id: parse_node_id(id)?,
             info_hash: parse_node_id(info_hash)?,
         });
+    }
+}
+
+impl KrpcQuery for GetPeersQuery {
+    type Reply = GetPeersReply;
+
+    fn method_name() -> &'static [u8] {
+        return b"get_peers".as_slice();
     }
 }
 
@@ -372,6 +437,117 @@ impl Message for GetPeersReply {
             values: out_values,
         });
     }
+}
+
+impl KrpcReply for GetPeersReply {
+
+}
+
+/// AnnouncePeer...
+impl Message for AnnouncePeerQuery {
+    fn to_bencode(&self) -> Object {
+        // {"id" : "<querying nodes id>", "info_hash" : "<info hash>", "port": <port>, "token": "<token>", "implied_port": <0 or 1>}
+        let mut dict = BTreeMap::from([
+            (b"id".to_vec(), Object::from(self.id.as_slice())),
+            (b"info_hash".to_vec(), Object::from(self.info_hash.as_slice())),
+            (b"port".to_vec(), Object::from(self.port as i64)),
+            (b"token".to_vec(), Object::from(self.token.as_slice())),
+        ]);
+        if self.implied_port {
+            dict.insert(b"implied_port".to_vec(), Object::from(1i64));
+        }
+        else {
+            // BEP 5 states: "implied_port which value is either 0 or 1."
+            // Some clients might expect 0 if not implied, though not explicitly stated for omission.
+            // For safety and clarity, explicitly sending 0 when false.
+            dict.insert(b"implied_port".to_vec(), Object::from(0i64));
+        }
+        return Object::from(dict);
+    }
+
+    fn from_bencode(obj: &Object) -> Option<Self> {
+        let dict = obj.as_dict()?;
+        let id = dict.get(b"id".as_slice())?.as_string()?;
+        let info_hash = dict.get(b"info_hash".as_slice())?.as_string()?;
+        let port = *dict.get(b"port".as_slice())?.as_int()? as u16;
+        let token = dict.get(b"token".as_slice())?.as_string()?;
+        let implied_port = match dict.get(b"implied_port".as_slice()) {
+            Some(val) => *val.as_int()? == 1,
+            None => false, // If not present, assume false.
+        };
+
+        return Some(Self {
+            id: parse_node_id(id)?,
+            info_hash: parse_node_id(info_hash)?, 
+            port,
+            token: token.to_vec(),
+            implied_port,
+        });
+    }
+}
+
+impl KrpcQuery for AnnouncePeerQuery {
+    type Reply = AnnouncePeerReply;
+
+    fn method_name() -> &'static [u8] {
+        return b"announce_peer".as_slice();
+    }
+}
+
+impl Message for AnnouncePeerReply {
+    fn to_bencode(&self) -> Object {
+        // {"id" : "<responding nodes id>"}
+        let dict = BTreeMap::from([
+            (b"id".to_vec(), Object::from(self.id.as_slice())),
+        ]);
+        return Object::from(dict);
+    }
+
+    fn from_bencode(obj: &Object) -> Option<Self> {
+        let dict = obj.as_dict()?;
+        let id = dict.get(b"id".as_slice())?.as_string()?;
+
+        return Some(Self {
+            id: parse_node_id(id)?,
+        });
+    }
+}
+
+impl KrpcReply for AnnouncePeerReply {
+
+}
+
+// ErrorReply...
+impl Message for ErrorReply {
+    fn to_bencode(&self) -> Object {
+        // [<error code>, "<error message>"]
+        return Object::from(vec![
+            Object::from(self.code),
+            Object::from(self.msg.as_bytes()),
+        ]);
+    }
+
+    fn from_bencode(obj: &Object) -> Option<Self> {
+        let list = obj.as_list()?;
+        if list.len() != 2 {
+            return None;
+        }
+        let code = list[0].as_int()?;
+        let msg = list[1].as_string()?;
+        let msg = match String::from_utf8(msg.clone()) {
+            Ok(val) => val,
+            Err(_) => return None, // Invalid UTF-8 string
+        };
+
+        return Some(Self {
+            code: *code,
+            msg: msg,
+        });
+    }
+}
+
+impl KrpcReply for ErrorReply {
+    
 }
 
 #[cfg(test)]

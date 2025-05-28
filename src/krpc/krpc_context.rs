@@ -1,6 +1,7 @@
 #![allow(dead_code)] // Let it shutup!
 
 use thiserror::Error;
+use tracing::debug;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, atomic};
@@ -9,8 +10,7 @@ use tokio::sync::oneshot;
 use tokio::net::UdpSocket;
 use tokio::io;
 
-use super::KrpcQuery;
-use super::Message;
+use super::{ErrorReply, KrpcQuery, KrpcReply};
 use super::Object;
 
 #[derive(Debug, Error)]
@@ -19,7 +19,7 @@ pub enum KrpcError {
     InvalidReply,
 
     #[error("The remote give us an error reply")]
-    ErrorReply,
+    Error(ErrorReply),
 
     #[error("The remote did not reply in time")]
     TimedOut,
@@ -69,7 +69,7 @@ fn extract_tid(obj: &Object) -> Option<u16> {
     return Some(u16::from_be_bytes(id));
 }
 
-fn extract_reply<T: Message>(obj: &Object) -> Option<T> {
+fn extract_reply<T: KrpcReply>(obj: &Object) -> Option<T> {
     let dict = obj.as_dict()?;
     if dict.get(b"y".as_slice())?.as_string()? != b"r".as_slice() { // Not a reply
         return None;
@@ -83,8 +83,7 @@ fn extract_query(obj: &Object) -> Option<Object> {
     if dict.get(b"y".as_slice())?.as_string()? != b"q".as_slice() { // Not a query
         return None;
     }
-    let q = dict.get(b"q".as_slice())?;
-    return Some(q.clone());
+    return Some(obj.clone());
 }
 
 impl Drop for CancelGuard {
@@ -113,7 +112,7 @@ impl KrpcContext {
     /// Create an Krpc Context 
     /// 
     /// sender: is the sender send the udp packet
-    fn new(sockfd: Arc<UdpSocket>) -> KrpcContext {
+    pub fn new(sockfd: Arc<UdpSocket>) -> KrpcContext {
         return KrpcContext { 
             inner: Arc::new(KrpcContextInner {
                 sockfd: sockfd,
@@ -123,8 +122,12 @@ impl KrpcContext {
         };
     }
 
+    pub fn is_ipv4(&self) -> bool {
+        return self.inner.sockfd.local_addr().expect("It should never failed").is_ipv4();
+    }
+
     /// Process the incoming udp packet, return query if it is a query
-    pub fn process_udp(&self, bytes: &[u8], ip: &SocketAddr) -> KrpcProcess {
+    pub fn process_udp(&self, bytes: &[u8], _ip: &SocketAddr) -> KrpcProcess {
         let (obj, _) = match Object::decode(bytes) {
             Some(val) => val,
             None => return KrpcProcess::InvalidMessage,
@@ -139,8 +142,8 @@ impl KrpcContext {
             Some(val) => val,
             None => return KrpcProcess::InvalidMessage,
         };
-        println!("debug: incoming message {:?} from {}", obj, ip);
-        let sender = match self.inner.pending.lock().unwrap().remove(&tid) {
+        // debug!("Incoming message {:?} from {}", obj, ip);
+        let sender = match self.inner.pending.lock().expect("Mutex posioned").remove(&tid) {
             Some(val) => val,
             None => return KrpcProcess::InvalidMessage,
         };
@@ -162,12 +165,12 @@ impl KrpcContext {
             (b"a".to_vec(), obj)
         ]);
         
-        self.inner.pending.lock().unwrap().insert(tid, sx);
+        self.inner.pending.lock().expect("Mutex posioned").insert(tid, sx);
         let mut guard = CancelGuard::new(tid, self.inner.clone());
 
         // Send the packet out
         let bytes = Object::from(query).encode();
-        println!("debug: send packet to {}", ip);
+        debug!("Send packet to {}", ip);
         match self.inner.sockfd.send_to(bytes.as_slice(), ip).await {
             Ok(_) => (),
             Err(err) => return Err(KrpcError::NetworkError(err)),
@@ -189,8 +192,8 @@ impl KrpcContext {
     }
 
     /// Send the krpc to the target endpoint and get the reply from it
-    pub async fn send_krpc<T: KrpcQuery + Message>(&self, msg: T, ip: &SocketAddr) -> Result<T::Reply, KrpcError> {
-        // Response = {"t":"aa", "y":"r", "r": {"id":"mnopqrstuvwxyz123456"}}
+    pub async fn send_krpc<T: KrpcQuery>(&self, msg: &T, ip: &SocketAddr) -> Result<T::Reply, KrpcError> {
+        // Reply = {"t":"aa", "y":"r", "r": {"id":"mnopqrstuvwxyz123456"}}
         let obj = self.send_krpc_impl(T::method_name(),msg.to_bencode(), ip).await?;
         let reply = match extract_reply::<T::Reply>(&obj) {
             Some(reply) => reply,
@@ -202,11 +205,28 @@ impl KrpcContext {
     /// Send the krpc to the target endpoint and get the reply from it 
     /// 
     /// with the timeout support
-    pub async fn send_krpc_with_timeout<T: KrpcQuery + Message>(&self, msg: T, ip: &SocketAddr, timeout: std::time::Duration) -> Result<T::Reply, KrpcError> {
+    pub async fn send_krpc_with_timeout<T: KrpcQuery>(&self, msg: &T, ip: &SocketAddr, timeout: std::time::Duration) -> Result<T::Reply, KrpcError> {
         match tokio::time::timeout(timeout, self.send_krpc(msg, ip)).await {
             Ok(res) => return res,
             Err(_) => return Err(KrpcError::TimedOut),
         }
+    }
+
+    async fn send_reply_impl(&self, tid: &[u8], msg: Object, ip: &SocketAddr) -> io::Result<()> {
+        // Reply = {"t":"aa", "y":"r", "r": {"id":"mnopqrstuvwxyz123456"}}
+        let reply = BTreeMap::from([
+            (b"t".to_vec(), Object::from(tid.to_vec())),
+            (b"y".to_vec(), Object::from(b"r".as_slice())),
+            (b"r".to_vec(), msg)
+        ]);
+        let encoded = Object::from(reply).encode();
+        let _len = self.inner.sockfd.send_to(encoded.as_slice(), ip).await?;
+        return Ok(());
+    }
+
+    /// Send the reply to the target endpoint
+    pub async fn send_reply<T: KrpcReply>(&self, tid: &[u8], msg: T, ip: &SocketAddr) -> io::Result<()> {
+        return self.send_reply_impl(tid, msg.to_bencode(), ip).await;
     }
 }
 
@@ -221,11 +241,12 @@ mod tests {
         let mut buffer = [0u8; 65535];
         loop {
             let (len, ip) = sockfd.recv_from(&mut buffer).await?;
-            println!("debug: recv packet from {}", ip);
+            debug!("recv packet from {}", ip);
             let _ = ctxt.process_udp(&buffer[0..len], &ip);
         }
     }
     #[tokio::test]
+    #[ignore]
     async fn test_krpc() -> io::Result<()> {
         let sockfd = Arc::new(UdpSocket::bind("[::0]:0").await?);
         let ctxt = KrpcContext::new(sockfd.clone());
@@ -239,12 +260,12 @@ mod tests {
                 id: NodeId::rand()
             };
             let ip = tokio::net::lookup_host("dht.transmissionbt.com:6881").await.unwrap().next().unwrap();
-            let res = ctxt.send_krpc_with_timeout(ping, &ip, std::time::Duration::new(5, 0)).await;
+            let res = ctxt.send_krpc_with_timeout(&ping, &ip, std::time::Duration::new(5, 0)).await;
             if let Ok(res) = res {
-                println!("debug: got ping reply {:?}", res);
+                debug!("got ping reply {:?}", res);
             }
             else {
-                println!("debug: got error {:?}", res);
+                debug!("got error {:?}", res);
             }
         }).await;
 

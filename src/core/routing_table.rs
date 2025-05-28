@@ -155,6 +155,9 @@ impl RoutingTable {
 
     /// Update the routing table by given info
     pub fn update_node(&mut self, target: NodeId, ip: &SocketAddr) -> Result<(), UpdateNodeError> {
+        if target.is_zero() {
+            return Err(UpdateNodeError::Failed); // Ignore the zero id
+        }
         let idx = self.calc_bucket_index(target);
         let buckets_len = self.buckets.len();
         let bucket = &mut self.buckets[idx];
@@ -188,6 +191,18 @@ impl RoutingTable {
         return Ok(());
     }
 
+    pub fn add_node(&mut self, target: NodeId, ip: &SocketAddr) -> Result<(), UpdateNodeError> {
+        loop {
+            match self.update_node(target, ip) {
+                Ok(_) => return Ok(()),
+                Err(UpdateNodeError::NeedSplit) => {
+                    self.split_bucket();
+                },
+                Err(UpdateNodeError::Failed) => return Err(UpdateNodeError::Failed),
+            }
+        }
+    }
+
     /// Remove the node by given id, return the removed node 
     pub fn remove_node(&mut self, target: NodeId) -> Option<(NodeId, SocketAddr)> {
         let (bucket, pos) = self.index_node_mut(target)?;
@@ -212,6 +227,7 @@ impl RoutingTable {
                 SplitBucketPosition::CurrentBucket => cur_vec.push(node),
                 SplitBucketPosition::NewBucket => new_vec.push(node),
                 SplitBucketPosition::WrongBucket(_idx) => { // It should not happen, node in wrong bucket
+                    eprintln!("WTF: Node {:?} in wrong bucket, should not happen!", node.id);
                     new_vec.push(node);
                 },
             }
@@ -231,6 +247,10 @@ impl RoutingTable {
         };
         node.last_seen = SystemTime::now(); // Avoid select the same node
         return Some((node.id, node.ip, duration));
+    }
+
+    pub fn add_router(&mut self, ip: &SocketAddr) {
+        self.routers.insert(ip.clone());
     }
 
     /// Get the num of the nodes in the table

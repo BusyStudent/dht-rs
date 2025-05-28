@@ -9,3 +9,5 @@ fastrand = { version = "2" }
 color-backtrace = { version = "0.7" }
 ctor = "0.4.2"
 thiserror = "2.0.12"
+tracing = { version = "^0.1.41", features = ["log"] }
+tracing-subscriber = "0.3.19"

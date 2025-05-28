@@ -1,8 +1,9 @@
 use std::ops::{BitXor, Index, IndexMut};
+use std::fmt;
 
 /// The NodeId of the DHT, 160 bits
 /// 
-#[derive(PartialOrd, Ord, PartialEq, Eq, Debug, Clone, Copy)]
+#[derive(PartialOrd, Ord, PartialEq, Eq, Clone, Copy)]
 pub struct NodeId {
     pub data: [u8; 20],
 }
@@ -47,12 +48,28 @@ impl NodeId {
         };
     }
 
+    /// Randomly generate a NodeId
     pub fn rand() -> NodeId {
         let mut arr = [0u8; 20];
         for i in arr.iter_mut() {
             *i = fastrand::u8(..);
         }
         return NodeId::new(arr);
+    }
+
+    pub fn from_hex(hex: &str) -> Option<NodeId> {
+        if hex.len() != 40 {
+            return None;
+        }
+        let mut arr = [0u8; 20];
+        for i in 0..20 {
+            let byte_str = &hex[i * 2..i * 2 + 2];
+            match u8::from_str_radix(byte_str, 16) {
+                Ok(byte) => arr[i] = byte,
+                Err(_) => return None,
+            }
+        }
+        return Some(NodeId::new(arr));
     }
 
     /// Cout How may leading zeros in this NodeId, if all zeros, return 160
@@ -63,6 +80,20 @@ impl NodeId {
             }
         }
         return 160; // All zeros
+    }
+
+    /// Check if this NodeId is all zero
+    pub fn is_zero(&self) -> bool {
+        return *self == NodeId::zero();
+    }
+
+    /// Make a hex string of the id
+    pub fn hex(&self) -> String {
+        let mut res = String::new();
+        for i in self.data.iter() {
+            res.push_str(&format!("{:02x}", i));
+        }
+        return res;
     }
 
     /// Get the slice of the id's data
@@ -78,6 +109,18 @@ impl NodeId {
     // Let self cast into vector
     pub fn to_vec(&self) -> Vec<u8> {
         return Vec::from(self.as_slice());
+    }
+}
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        return write!(f, "{}", self.hex());
+    }
+}
+
+impl fmt::Debug for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        return write!(f, "NodeId({})", self.hex());
     }
 }
 
@@ -128,5 +171,20 @@ mod tests {
         let rand_id = NodeId::rand();
         assert_eq!(rand_id ^ zero, rand_id);
         assert_eq!(rand_id ^ rand_id, zero);
+    }
+
+    #[test]
+    fn test_hex() {
+        let id = NodeId::new([0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+                              0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
+                              0x12, 0x34, 0x56, 0x78]);
+        assert_eq!(id.hex(), "123456789abcdef0123456789abcdef012345678");
+
+        for i in 0..20 {
+            let id = NodeId::rand();
+            let hex = id.hex();
+            let parsed_id = NodeId::from_hex(&hex).unwrap();
+            assert_eq!(id, parsed_id, "Failed to parse hex for id {}", i);
+        }
     }
 }
