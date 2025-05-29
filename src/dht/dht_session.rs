@@ -2,19 +2,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{debug, error, warn};
 
-
-
 use super::{NodeId, RoutingTable};
 use super::krpc::*;
 
+const KRPC_TIMEOUT_DRUATION: Duration = Duration::from_secs(3); // The default timeout of krpc
+const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60); // The minimum interval for node refresh
+const NUM_QUERIES_PER_ITERATION: usize = 3; // The queries of per iterations
 const MAX_ITERATIONS_WITH_CONVERGENCE: usize = 3; // The max iterations with convergence
 const MAX_ITERATIONS: usize = 16; // The max iterations of the find_node / get_peers
-const MAX_ALPHA: usize = 3;
+const MAX_ALPHA: usize = 10; // Use more cocorrent requests, to speed up the process
 
 struct DhtSessionInner {
     routing_table: Mutex<RoutingTable>,
@@ -71,6 +72,10 @@ impl DhtSession {
         }
     }
 
+    fn routing_table_mut(&self) -> MutexGuard<'_, RoutingTable> {
+        return self.inner.routing_table.lock().expect("Mutex poisoned")
+    }
+
     pub fn new(id: NodeId, krpc: KrpcContext) -> DhtSession {
         let ipv4 = krpc.is_ipv4();
         return DhtSession {
@@ -81,87 +86,106 @@ impl DhtSession {
                     krpc: krpc,
                     id: id,
                     ipv4: ipv4,
-                    timeout: Duration::from_secs(3),
+                    timeout: KRPC_TIMEOUT_DRUATION,
                 }
             )
         };
     }
 
     /// Wrapper for do krpc, manage the life time
-    async fn do_krpc<T: KrpcQuery>(self, msg: T, ip: SocketAddr) -> (Result<T::Reply, KrpcError>, SocketAddr) {
+    /// 
+    /// `id` The node id we are querying, if it is zero, we don't know the id 
+    /// 
+    /// `ip` The ip address we are querying
+    async fn do_krpc<T: KrpcQuery>(self, msg: T, id: NodeId, ip: SocketAddr) -> (Result<T::Reply, KrpcError>, SocketAddr) {
         let mut idx = 0;
         loop {
-            debug!("Sending {} KRPC message to {}, Try {}", str::from_utf8(T::method_name()).unwrap(), ip, idx);
+            debug!("Sending {} KRPC message to {}, Try {}", std::str::from_utf8(T::method_name()).unwrap(), ip, idx);
             let result = self.inner.krpc.send_krpc_with_timeout(&msg, &ip, self.inner.timeout).await;
             if let Err(KrpcError::TimedOut) = result {
                 debug!("KRPC request timed out for {}, retrying...", ip);
                 idx += 1;
-                if idx >= 3 {
-                    return (result, ip);
+                if idx < 2 {
+                    continue;
                 }
+            }
+            if let Err(e) = &result {
+                debug!("KRPC request failed for {}: {}", ip, e);
+                if !id.is_zero() { // We known the id, mark it as bad
+                    self.routing_table_mut().node_timeout(id);
+                }
+            }
+            else if !id.is_zero() { // is OK, we need to update it in routing table
+                let _ = self.routing_table_mut().update_node(id, &ip);
             }
             return (result, ip); // Done
         }
     }
     
     // Doing the find logical
-    pub async fn find_node_impl(&self, mut queue: Vec<NodeEndpoint>, target: NodeId) -> Result<Vec<NodeEndpoint>, FindNodeError> {
-        if queue.is_empty() {
-            panic!("Queue should not be empty");
-        }
+    async fn find_node_impl(&self, mut queue: Vec<NodeEndpoint>, target: NodeId) -> Result<Vec<NodeEndpoint>, FindNodeError> {
         sort_node_and_unique(&mut queue, target);
         let mut join_set = JoinSet::new();
         let mut visited = BTreeSet::new();
         let mut collected = Vec::new();
         let mut output = Vec::new();
         let mut iteration_with_convergence = 0;
-        for _iteration in 0..MAX_ITERATIONS {
-            if queue.is_empty() {
+        let mut queries_completed = 0; // The number of queries completed
+        while queries_completed < MAX_ITERATIONS * NUM_QUERIES_PER_ITERATION {
+            if queue.is_empty() && join_set.is_empty() {
                 warn!("No more nodes to query, stopping the search.");
                 break;
             }
-            let num = queue.len().min(MAX_ALPHA);
-            for (_node_id, ip) in queue.drain(0..num) {
-                // Send the find_node request
-                let msg = FindNodeQuery {
-                    id: self.inner.id,
-                    target: target,
-                };
+            if join_set.len() < MAX_ALPHA {
+                // We can spawn more futures
+                let num = std::cmp::min(MAX_ALPHA - join_set.len(), queue.len());
 
-                let fut = self.clone().do_krpc(msg, ip);
-                join_set.spawn(fut);
-            }
-            // Wait for all futures to complete
-            while let Some(res) = join_set.join_next().await {
-                let (result, ip) = match res {
-                    Ok(what) => what,
-                    Err(_) => continue, // Set is empty...
-                };
-                let reply = match result {
-                    Ok(reply) => reply,
-                    Err(err) => {
-                        // TODO: Notify the routing table, it failed
-                        debug!("Failed to do krpc on {} => {}", ip, err);
-                        visited.insert(ip.clone());
-                        continue;
-                    }
-                };
-                // Try add it to the routing table, it give us reply
-                let _ = self.inner.routing_table.lock().expect("Mutex poisoned").add_node(reply.id, &ip);
-                visited.insert(ip);
+                for (id, ip) in queue.drain(0..num) {
+                    // Send the find_node request
+                    let msg = FindNodeQuery {
+                        id: self.inner.id,
+                        target: target,
+                    };
 
-                // Update the nodes...
-                for (id, ip) in reply.nodes.iter() {
-                    if !self.is_native_addr(ip) {
-                        continue; // Skip the non-native addresses
-                    }
-                    if visited.contains(ip) {
-                        continue; // Already visited this node
-                    }
-                    queue.push((*id, *ip));
+                    let fut = self.clone().do_krpc(msg, id, ip);
+                    join_set.spawn(fut);
                 }
-                collected.extend_from_slice(reply.nodes.as_slice());
             }
+
+            // Try to wait one future to complete
+            let res = match join_set.join_next().await {
+                Some(res) => res,
+                None => continue,
+            };
+            // One future completed, check the result
+            queries_completed += 1;
+            let (result, ip) = match res {
+                Ok(what) => what,
+                Err(_) => continue, // Set is empty...
+            };
+            let reply = match result {
+                Ok(reply) => reply,
+                Err(_) => {
+                    visited.insert(ip.clone()); // Mark failed as visited
+                    continue;
+                }
+            };
+            // Try add it to the routing table, it give us reply
+            let _ = self.routing_table_mut().add_node(reply.id, &ip);
+            visited.insert(ip);
+
+            // Update the nodes...
+            for (id, ip) in reply.nodes.iter() {
+                if !self.is_native_addr(ip) {
+                    continue; // Skip the non-native addresses
+                }
+                if visited.contains(ip) {
+                    continue; // Already visited this node
+                }
+                queue.push((*id, *ip));
+            }
+            collected.extend_from_slice(reply.nodes.as_slice());
+            
             sort_node_and_unique(&mut queue, target);
             sort_node_and_unique(&mut collected, target);
 
@@ -176,7 +200,7 @@ impl DhtSession {
             }
             else {
                 iteration_with_convergence += 1;
-                if iteration_with_convergence >= MAX_ITERATIONS_WITH_CONVERGENCE {
+                if iteration_with_convergence >= NUM_QUERIES_PER_ITERATION * MAX_ITERATIONS_WITH_CONVERGENCE {
                     debug!("Convergence reached, stopping the search.");
                     break; // We have convergence, stop the search
                 }
@@ -185,6 +209,8 @@ impl DhtSession {
             // Avoid to grow too large
             queue.truncate(8 * 8);
             collected.truncate(8 * 8);
+
+            debug!("find_node: queries_completed {queries_completed}, iteration_with_convergence {iteration_with_convergence}");
         }
         // Done
         join_set.shutdown().await;
@@ -194,6 +220,12 @@ impl DhtSession {
         }
         debug!("Found {} nodes for target: {}", output.len(), target);
         return Ok(output);
+    }
+
+    pub async fn find_node(self, target: NodeId) -> Result<Vec<NodeEndpoint>, FindNodeError> {
+        // Get the nodes from routing table
+        let queue = self.routing_table_mut().find_node(target);
+        return self.find_node_impl(queue, target).await;
     }
 
     // Process the incoming udp packet
@@ -210,8 +242,7 @@ impl DhtSession {
                 return false; // Invalid query
             }
         };
-        // debug!("Received query {}: ", str::from_utf8(method));
-        match method {
+        let id = match method {
             b"ping" => {
                 let query = match PingQuery::from_bencode(msg) {
                     Some(val) => val,
@@ -220,22 +251,23 @@ impl DhtSession {
                 let reply = PingReply {
                     id: self.inner.id,
                 };
-                let _ = self.inner.routing_table.lock().expect("Mutex poisoned").update_node(query.id, ip);
                 let _ = self.inner.krpc.send_reply(tid, reply, ip).await;
-                return true;
+
+                query.id
             },
             b"find_node" => {
                 let query = match FindNodeQuery::from_bencode(msg) {
                     Some(val) => val,
                     None => return false,
                 };
-                let nodes = self.inner.routing_table.lock().expect("Mutex poisoned").find_node(query.target);
+                let nodes = self.routing_table_mut().find_node(query.target);
                 let reply = FindNodeReply {
                     id: self.inner.id,
                     nodes: nodes,
                 };
                 let _ = self.inner.krpc.send_reply(tid, reply, ip).await;
-                return true;
+
+                query.id
             },
             b"get_peers" => {
                 let query = match GetPeersQuery::from_bencode(msg) {
@@ -244,7 +276,7 @@ impl DhtSession {
                 };
                 // Find the infohash in the routing table and collect the peers if exists
                 let mut values = Vec::new();
-                let nodes = self.inner.routing_table.lock().expect("Mutex poisoned").find_node(query.info_hash);
+                let nodes = self.routing_table_mut().find_node(query.info_hash);
                 if let Some(peers) = self.inner.peers.lock().expect("Mutex poisoned").get(&query.info_hash) {
                     for peer in peers {
                         values.push(peer.clone());
@@ -262,7 +294,8 @@ impl DhtSession {
                     values: values,
                 };
                 let _ = self.inner.krpc.send_reply(tid, reply, ip).await;
-                return true;
+
+                query.id
             },
             b"announce_peer" => {
                 let query = match AnnouncePeerQuery::from_bencode(msg) {
@@ -293,7 +326,8 @@ impl DhtSession {
                     id: self.inner.id,
                 };
                 let _ = self.inner.krpc.send_reply(tid, reply, ip).await;
-                return true;
+
+                query.id
             },
             _ => {
                 error!("Unknown method: {}", String::from_utf8_lossy(method));
@@ -304,16 +338,20 @@ impl DhtSession {
                 let _ = self.inner.krpc.send_reply(tid, reply, ip).await;
                 return true; // Unknown method, but still a valid query for process udp
             },
-        }
+        };
+        debug!("Received query method {} from {}: {} ", String::from_utf8_lossy(method), id, ip);
+        let _ = self.routing_table_mut().update_node(id, ip);
+        return true;
     }
 
-    pub async fn bootstrap(&self) -> bool {
+    async fn bootstrap(&self) -> bool {
         let routers = [
             "dht.transmissionbt.com:6881",
             "router.bittorrent.com:6881",
             "router.utorrent.com:6881",
         ];
-        let mut queue = Vec::new();
+        // Use the nodes from routing table as init queue (emm, default is 0 nodes)
+        let mut queue: Vec<NodeEndpoint> = self.routing_table_mut().iter().collect();
         for each in routers {
             let res = match tokio::net::lookup_host(each).await {
                 Ok(res) => res,
@@ -322,7 +360,7 @@ impl DhtSession {
                     continue; // Skip this router if lookup fails
                 }
             };
-            let mut table = self.inner.routing_table.lock().expect("Mutex poisoned");
+            let mut table = self.routing_table_mut();
             for ip in res {
                 table.add_router(&ip); // Add this ip as router, to filter 
                 if self.is_native_addr(&ip) {
@@ -339,7 +377,7 @@ impl DhtSession {
                 return false;
             }
         };
-        let mut len = self.inner.routing_table.lock().expect("Mutex poisoned").nodes_len();
+        let mut len = self.routing_table_mut().nodes_len();
         let mut iter = 0;
         if len == 0 {
             // Emm, we have no nodes in the routing table, let run retry
@@ -347,32 +385,65 @@ impl DhtSession {
         }
         while len <= 50 && iter < 10 { // Doing random search to fill our bucket
             let id = NodeId::rand();
-            let nodes = self.inner.routing_table.lock().expect("Mutex poisoned").find_node(id);
+            let nodes = self.routing_table_mut().find_node(id);
             if nodes.is_empty() {
                 // No nodes found, try again
                 iter += 1;
                 continue;
             }
             let _ = self.find_node_impl(nodes, id).await;
-            len = self.inner.routing_table.lock().expect("Mutex poisoned").nodes_len();
+            len = self.routing_table_mut().nodes_len();
             iter += 1;
         }
         return true;
     }
 
+    /// Doing to refresh the routing table
+    pub async fn refresh_routing_table(&self) {
+        loop {
+            let mut ping_set = JoinSet::new();
+            if self.routing_table_mut().nodes_len() < 8 {
+                // Not enough nodes, try to bootstrap again
+                return;
+            }
+            while let Some((id, ip, duration)) = self.routing_table_mut().next_refresh_node(MIN_REFRESH_INTERVAL) {
+                debug!("Refreshing node {} at {}, last seen in {:?}", id, ip, duration);
+                let query = FindNodeQuery {
+                    id: self.inner.id,
+                    target: NodeId::rand(),
+                };
+                ping_set.spawn(self.clone().do_krpc(query, id, ip));
+            }
+            let _ = ping_set.join_all().await;
+
+            // Get the buckets indexes which node.len() < K / 2, refresh them
+            let mut refresh_set = JoinSet::new();
+            for i in self.routing_table_mut().less_node_buckets_indexes(8 / 2) { // Less than HALF K
+                // We need to fill the empty buckets, so we can find more nodes
+                debug!("Refreshing empty bucket at index {}", i);
+                let id = NodeId::rand_with_prefix(self.inner.id, i);
+                refresh_set.spawn(self.clone().find_node(id));
+            }
+            let _ = refresh_set.join_all().await;
+
+            // Sleep for a while before next refresh
+            tokio::time::sleep(MIN_REFRESH_INTERVAL).await;
+            // debug dump the routing table
+            debug!("Refresh done, routing table {:?}", self.routing_table_mut());
+        }
+    }
+
     pub async fn run(&self) {
         // Doing the bootstrap
         loop {
-            if self.bootstrap().await {
-                debug!("DHT session bootstrap completed successfully.");
-                break;
-            } 
-            else {
+            if !self.bootstrap().await {
                 error!("DHT session bootstrap failed, retrying...");
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            }
+                continue;
+            } 
+            debug!("DHT session bootstrap done, routing table {:?}", self.routing_table_mut());
+            self.refresh_routing_table().await;
         }
-        // TODO: add subtask for handling refreshing the routing table
     }
 }
 
@@ -411,7 +482,7 @@ mod tests {
                         continue;
                     }
                 };
-                debug!("Received packet from {}", ip);
+                // debug!("Received packet from {}", ip);
                 session.process_udp(&buffer[0..len], &ip).await;
             }
         });

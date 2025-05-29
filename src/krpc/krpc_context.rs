@@ -1,7 +1,6 @@
 #![allow(dead_code)] // Let it shutup!
 
 use thiserror::Error;
-use tracing::debug;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, atomic};
@@ -170,7 +169,7 @@ impl KrpcContext {
 
         // Send the packet out
         let bytes = Object::from(query).encode();
-        debug!("Send packet to {}", ip);
+        // debug!("Send packet to {}", ip);
         match self.inner.sockfd.send_to(bytes.as_slice(), ip).await {
             Ok(_) => (),
             Err(err) => return Err(KrpcError::NetworkError(err)),
@@ -234,7 +233,7 @@ impl KrpcContext {
 mod tests {
     use tokio::net::UdpSocket;
     use crate::{krpc::PingQuery, NodeId};
-
+    use tracing::debug;
     use super::*;
 
     async fn process_udp_to_krpc(ctxt: KrpcContext, sockfd: Arc<UdpSocket>) -> io::Result<()> {

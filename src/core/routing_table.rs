@@ -5,11 +5,13 @@ use std::collections::{BTreeSet, VecDeque};
 use std::net::{SocketAddr};
 use std::time::{Duration, SystemTime};
 use std::cmp;
+use tracing::{error, debug};
+
 use super::NodeId;
 
 pub const KBUCKET_SIZE: usize = 8;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum NodeStatus {
     Good,
     Questionable,
@@ -34,7 +36,6 @@ struct KBucket {
 }
 
 /// The routing table of the DHT
-#[derive(Debug)]
 pub struct RoutingTable {
     routers: BTreeSet<SocketAddr>, // The endpoints of the bootstrap node, ignore it
     ips: BTreeSet<SocketAddr>, // The endpoints is to limits the same endpoint but id is different
@@ -140,7 +141,7 @@ impl RoutingTable {
             for node in &bucket.nodes {
                 res.push((node.id, node.ip));
             }
-            if res.len() == KBUCKET_SIZE {
+            if res.len() >= KBUCKET_SIZE {
                 break;
             }
         }
@@ -150,6 +151,7 @@ impl RoutingTable {
             let rd = b.0 ^ target;
             return ld.cmp(&rd);
         });
+        res.truncate(KBUCKET_SIZE);
         return res;
     }
 
@@ -170,6 +172,8 @@ impl RoutingTable {
                 return Err(UpdateNodeError::Failed);
             }
             // Got it, just update the timestamp and move
+            debug!("Update node {}: {}", target, ip);
+            node.status = NodeStatus::Good;
             node.last_seen = SystemTime::now();
             bucket.last_seen = SystemTime::now();
             return Ok(());
@@ -191,6 +195,8 @@ impl RoutingTable {
         return Ok(());
     }
 
+    /// Add node into the routing table, it will handle the split logic automatically
+    /// If the node already exists, it will update the timestamp and return Ok(()), if the bucket is full, it will split the bucket
     pub fn add_node(&mut self, target: NodeId, ip: &SocketAddr) -> Result<(), UpdateNodeError> {
         loop {
             match self.update_node(target, ip) {
@@ -211,6 +217,27 @@ impl RoutingTable {
         return Some((node.id, node.ip));
     }
 
+    /// Mark an node as timeout
+    pub fn node_timeout(&mut self, target: NodeId) {
+        if let Some((bucket, pos)) = self.index_node_mut(target) {
+            let node = &mut bucket.nodes[pos];
+            match node.status {
+                NodeStatus::Questionable => {
+                    debug!("Node {} is timeout, before that is question, mark it as bad", node.id);
+                    node.status = NodeStatus::Bad;
+                },
+                NodeStatus::Good => {
+                    debug!("Node {} is timeout, mark it as questionable", node.id);
+                    node.status = NodeStatus::Questionable;
+                },
+                NodeStatus::Bad => {
+                    debug!("Node {} is timeout, and bad, remove it", node.id);
+                    bucket.nodes.remove(pos);
+                },
+            }
+        }
+    }
+
     /// Split the bucket
     pub fn split_bucket(&mut self) {
         let buckets_len = self.buckets.len();
@@ -227,7 +254,7 @@ impl RoutingTable {
                 SplitBucketPosition::CurrentBucket => cur_vec.push(node),
                 SplitBucketPosition::NewBucket => new_vec.push(node),
                 SplitBucketPosition::WrongBucket(_idx) => { // It should not happen, node in wrong bucket
-                    eprintln!("WTF: Node {:?} in wrong bucket, should not happen!", node.id);
+                    error!("WTF: Node {:?} in wrong bucket, should not happen!", node.id);
                     new_vec.push(node);
                 },
             }
@@ -238,15 +265,35 @@ impl RoutingTable {
     }
 
     /// Get the next node we need to refresh
-    pub fn next_refresh_node(&mut self) -> Option<(NodeId, SocketAddr, Duration)> {  
-        let bucket = self.buckets.iter_mut().min_by_key(|bucket| bucket.last_seen )?;
-        let node = bucket.nodes.iter_mut().min_by_key(|node| node.last_seen )?;
+    pub fn next_refresh_node(&mut self, min_duration: Duration) -> Option<(NodeId, SocketAddr, Duration)> {  
+        let mut vec = Vec::new();
+        for bucket in self.buckets.iter_mut() {
+            for node in bucket.nodes.iter_mut() {
+                vec.push(node);
+            }
+        }
+        vec.sort_by(|a, b| a.last_seen.cmp(&b.last_seen) );
+        let node = vec.first_mut()?;
         let duration = match node.last_seen.elapsed() {
             Ok(duration) => duration,
-            Err(_) => return None, // Why it happen?, the system clock changed?
+            Err(_) => return None,
         };
-        node.last_seen = SystemTime::now(); // Avoid select the same node
+        if duration < min_duration {
+            return None;
+        }
+        node.last_seen = SystemTime::now(); // Avoid select the node twice
         return Some((node.id, node.ip, duration));
+    }
+
+    /// Get the bucket node size is less than it
+    pub fn less_node_buckets_indexes(&self, len: usize) -> Vec<usize> {
+        let mut res = Vec::new();
+        for (i, bucket) in self.buckets.iter().enumerate() {
+            if bucket.nodes.len() < len {
+                res.push(i);
+            }
+        }
+        return res;
     }
 
     pub fn add_router(&mut self, ip: &SocketAddr) {
@@ -255,14 +302,42 @@ impl RoutingTable {
 
     /// Get the num of the nodes in the table
     pub fn nodes_len(&self) -> usize {
-        let mut len = 0;
+        return self.ips.len(); // Use ips to count, it is more accurate
+    }
+
+    /// Iterate the nodes in the routing table, from the closest to the farest
+    pub fn iter(&self) -> impl Iterator<Item = (NodeId, SocketAddr)> + '_ {
+        let mut vec = Vec::new();
         for bucket in self.buckets.iter() {
-            len += bucket.nodes.len();
+            for node in bucket.nodes.iter() {
+                vec.push((node.id.clone(), node.ip.clone()));
+            }
         }
-        return len;
+        vec.sort_by(|a, b| {
+            let ld = a.0 ^ self.id;
+            let rd = b.0 ^ self.id;
+            return ld.cmp(&rd);
+        });
+        return vec.into_iter();
     }
 }
 
+impl std::fmt::Debug for RoutingTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Print the routing table in a readable format
+        let zero = Duration::from_secs(0);
+        write!(f, "RoutingTable {{ id: {}, buckets: [\n", self.id.hex())?;
+        for (i, bucket) in self.buckets.iter().enumerate() {
+            write!(f, "  Bucket {}: [\n", i)?;
+            for node in &bucket.nodes {
+                let duration = node.last_seen.elapsed().unwrap_or(zero);
+                write!(f, "    {}: {} Last seen {}s , \n", node.id.hex(), node.ip, duration.as_secs())?;
+            }
+            write!(f, "  ], \n")?;
+        }
+        return write!(f, "] }}");
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -3,7 +3,7 @@ use std::fmt;
 
 /// The NodeId of the DHT, 160 bits
 /// 
-#[derive(PartialOrd, Ord, PartialEq, Eq, Clone, Copy)]
+#[derive(PartialOrd, Ord, PartialEq, Eq, Clone, Copy, Hash)]
 pub struct NodeId {
     pub data: [u8; 20],
 }
@@ -57,6 +57,20 @@ impl NodeId {
         return NodeId::new(arr);
     }
 
+    /// Generates a NodeId that shares the first prefix_len bits with id, differs at bit prefix_len (if prefix_len < 160), and has random bits thereafter
+    pub fn rand_with_prefix(id: NodeId, prefix_len: usize) -> NodeId {
+        assert!(prefix_len <= 160, "Prefix must be less than or equal to 160 bits.");
+        let mut out = NodeId::rand();
+        for i in 0..prefix_len {
+            out.bit_set(i, id.bit_test(i)); // Cppy the bits from the given id
+        }
+        // Flip the next bit to ensure the prefix are same
+        if prefix_len < 160 {
+            out.bit_set(prefix_len, !id.bit_test(prefix_len)); 
+        }
+        return out;
+    }
+
     pub fn from_hex(hex: &str) -> Option<NodeId> {
         if hex.len() != 40 {
             return None;
@@ -96,6 +110,49 @@ impl NodeId {
         return res;
     }
 
+    /// Make a binary string of the id
+    pub fn bin(&self) -> String {
+        let mut res = String::new();
+        for i in self.data.iter() {
+            res.push_str(&format!("{:08b}", i));
+        }
+        return res;
+    }
+
+    /// Check the bit at the given index
+    pub fn bit_test(&self, bit: usize) -> bool {
+        if bit >= 160 {
+            panic!("Bit index out of range: {}. NodeId is 160 bits long.", bit);
+        }
+        let byte_index = bit / 8;
+        let bit_index = bit % 8;
+        return (self.data[byte_index] & (1 << (7 - bit_index))) != 0;
+    }
+
+    /// Flip the bit at the given index
+    pub fn bit_flip(&mut self, bit: usize) {
+        if bit >= 160 {
+            panic!("Bit index out of range: {}. NodeId is 160 bits long.", bit);
+        }
+        let byte_index = bit / 8;
+        let bit_index = bit % 8;
+        self.data[byte_index] ^= 1 << (7 - bit_index);
+    }
+
+    pub fn bit_set(&mut self, bit: usize, value: bool) {
+        if bit >= 160 {
+            panic!("Bit index out of range: {}. NodeId is 160 bits long.", bit);
+        }
+        let byte_index = bit / 8;
+        let bit_index = bit % 8;
+        if value {
+            self.data[byte_index] |= 1 << (7 - bit_index);
+        }
+        else {
+            self.data[byte_index] &= !(1 << (7 - bit_index));
+        }
+    }
+
     /// Get the slice of the id's data
     pub fn as_slice(&self) -> &[u8] {
         return self.data.as_slice();
@@ -120,7 +177,7 @@ impl fmt::Display for NodeId {
 
 impl fmt::Debug for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        return write!(f, "NodeId({})", self.hex());
+        return write!(f, "NodeId({})", self.bin());
     }
 }
 
@@ -185,6 +242,32 @@ mod tests {
             let hex = id.hex();
             let parsed_id = NodeId::from_hex(&hex).unwrap();
             assert_eq!(id, parsed_id, "Failed to parse hex for id {}", i);
+        }
+    }
+
+    #[test]
+    fn test_bit_test() {
+        let mut id = NodeId::new([0b00000000; 20]);
+        id.bit_set(0, true);
+        id.bit_set(1, true);
+        id.bit_set(2, true);
+        assert!(id.bit_test(0));
+        assert!(id.bit_test(1));
+        assert!(id.bit_test(2));
+        assert!(!id.bit_test(3));
+        
+        id.bit_flip(0);
+        assert!(!id.bit_test(0));
+    }
+
+    #[test]
+    fn test_rand_with_prefix() {
+        for _ in 0..100 {
+            let id = NodeId::rand();
+            let prefix = fastrand::usize(0..160);
+            let new_id = NodeId::rand_with_prefix(id, prefix);
+            let xor = (id ^ new_id).leading_zeros();
+            assert_eq!(xor, prefix as u32, "Failed for id: {:?}, new id {:?}, prefix: {}", id, new_id, prefix);
         }
     }
 }
