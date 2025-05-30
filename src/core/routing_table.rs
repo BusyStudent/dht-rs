@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::net::{SocketAddr};
 use std::time::{Duration, SystemTime};
 use std::cmp;
-use tracing::{error, debug};
+use tracing::{debug, error, info, trace};
 
 use super::NodeId;
 
@@ -172,7 +172,7 @@ impl RoutingTable {
                 return Err(UpdateNodeError::Failed);
             }
             // Got it, just update the timestamp and move
-            debug!("Update node {}: {}", target, ip);
+            trace!("Update node {}: {}", target, ip);
             node.status = NodeStatus::Good;
             node.last_seen = SystemTime::now();
             bucket.last_seen = SystemTime::now();
@@ -231,7 +231,7 @@ impl RoutingTable {
                     node.status = NodeStatus::Questionable;
                 },
                 NodeStatus::Bad => {
-                    debug!("Node {} is timeout, and bad, remove it", node.id);
+                    info!("Node {} is timeout, and bad, remove it", node.id);
                     bucket.nodes.remove(pos);
                 },
             }

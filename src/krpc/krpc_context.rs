@@ -1,6 +1,7 @@
 #![allow(dead_code)] // Let it shutup!
 
 use thiserror::Error;
+use tracing::warn;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, atomic};
@@ -219,7 +220,10 @@ impl KrpcContext {
             (b"r".to_vec(), msg)
         ]);
         let encoded = Object::from(reply).encode();
-        let _len = self.inner.sockfd.send_to(encoded.as_slice(), ip).await?;
+        let len = self.inner.sockfd.send_to(encoded.as_slice(), ip).await?;
+        if encoded.len() != len {
+            warn!("Send reply to {} failed, expected {} bytes, but sent {} bytes", ip, encoded.len(), len); // Why?
+        }
         return Ok(());
     }
 

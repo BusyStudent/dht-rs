@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::task::JoinSet;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use super::{NodeId, RoutingTable};
 use super::krpc::*;
@@ -73,7 +73,7 @@ impl DhtSession {
     }
 
     fn routing_table_mut(&self) -> MutexGuard<'_, RoutingTable> {
-        return self.inner.routing_table.lock().expect("Mutex poisoned")
+        return self.inner.routing_table.lock().expect("Mutex poisoned");
     }
 
     pub fn new(id: NodeId, krpc: KrpcContext) -> DhtSession {
@@ -100,17 +100,17 @@ impl DhtSession {
     async fn do_krpc<T: KrpcQuery>(self, msg: T, id: NodeId, ip: SocketAddr) -> (Result<T::Reply, KrpcError>, SocketAddr) {
         let mut idx = 0;
         loop {
-            debug!("Sending {} KRPC message to {}, Try {}", std::str::from_utf8(T::method_name()).unwrap(), ip, idx);
+            trace!("Sending {} KRPC message to {}, Try {}", std::str::from_utf8(T::method_name()).unwrap(), ip, idx);
             let result = self.inner.krpc.send_krpc_with_timeout(&msg, &ip, self.inner.timeout).await;
             if let Err(KrpcError::TimedOut) = result {
-                debug!("KRPC request timed out for {}, retrying...", ip);
+                trace!("KRPC request timed out for {}, retrying...", ip);
                 idx += 1;
                 if idx < 2 {
                     continue;
                 }
             }
             if let Err(e) = &result {
-                debug!("KRPC request failed for {}: {}", ip, e);
+                trace!("KRPC request failed for {}: {}", ip, e);
                 if !id.is_zero() { // We known the id, mark it as bad
                     self.routing_table_mut().node_timeout(id);
                 }
@@ -210,7 +210,7 @@ impl DhtSession {
             queue.truncate(8 * 8);
             collected.truncate(8 * 8);
 
-            debug!("find_node: queries_completed {queries_completed}, iteration_with_convergence {iteration_with_convergence}");
+            trace!("find_node: queries_completed {queries_completed}, iteration_with_convergence {iteration_with_convergence}");
         }
         // Done
         join_set.shutdown().await;
@@ -222,6 +222,7 @@ impl DhtSession {
         return Ok(output);
     }
 
+    /// Find the nodes for the target node id, return the K-nearest nodes
     pub async fn find_node(self, target: NodeId) -> Result<Vec<NodeEndpoint>, FindNodeError> {
         // Get the nodes from routing table
         let queue = self.routing_table_mut().find_node(target);
@@ -302,6 +303,7 @@ impl DhtSession {
                     Some(val) => val,
                     None => return false,
                 };
+                info!("Collecting infohash {} from {}", query.info_hash, ip);
                 if query.token != ip.to_string().into_bytes() {
                     // Invalid token, ignore it
                     error!("Invalid token: {:?}", query.token);
@@ -339,7 +341,7 @@ impl DhtSession {
                 return true; // Unknown method, but still a valid query for process udp
             },
         };
-        debug!("Received query method {} from {}: {} ", String::from_utf8_lossy(method), id, ip);
+        trace!("Received query method {} from {}: {} ", String::from_utf8_lossy(method), id, ip);
         let _ = self.routing_table_mut().update_node(id, ip);
         return true;
     }
@@ -399,7 +401,7 @@ impl DhtSession {
     }
 
     /// Doing to refresh the routing table
-    pub async fn refresh_routing_table(&self) {
+    async fn refresh_routing_table(&self) {
         loop {
             let mut ping_set = JoinSet::new();
             if self.routing_table_mut().nodes_len() < 8 {
@@ -420,7 +422,7 @@ impl DhtSession {
             let mut refresh_set = JoinSet::new();
             for i in self.routing_table_mut().less_node_buckets_indexes(8 / 2) { // Less than HALF K
                 // We need to fill the empty buckets, so we can find more nodes
-                debug!("Refreshing empty bucket at index {}", i);
+                debug!("Refreshing bucket at index {}", i);
                 let id = NodeId::rand_with_prefix(self.inner.id, i);
                 refresh_set.spawn(self.clone().find_node(id));
             }
