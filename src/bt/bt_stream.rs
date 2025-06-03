@@ -1,11 +1,13 @@
 #![allow(dead_code)] // Let it shutup!
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, AsyncReadExt};
+use std::collections::BTreeMap;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::io;
+use tracing::{trace, debug};
 use thiserror::Error;
 use crate::bencode::Object;
 use crate::InfoHash;
 
-// LEN(1) + "Bittorrent protocol"(19) + reserved bytes(8) + infohash(20) + peerid(20)
+// LEN(1) + "BitTorrent protocol"(19) + reserved bytes(8) + infohash(20) + peerid(20)
 // struct alignas (1) BtHandshakeMessage {
 //     std::byte pstrlen;
 //     std::array<std::byte, 19> pstr;
@@ -14,10 +16,9 @@ use crate::InfoHash;
 //     PeerId peerId; 20 bytes
 // };
 
-const BT_PROTOCOL_STR : &'static str = "Bittorrent protocol";
+const BT_PROTOCOL_STR : &[u8] = b"BitTorrent protocol";
 const BT_PROTOCOL_LEN : usize = BT_PROTOCOL_STR.len();
-
-pub type PeerId = [u8; 20];
+const MAX_MESSAGE_LEN : u32 = 1024 * 1024 * 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -35,27 +36,66 @@ pub enum BtMessageId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BtMessage {
-    id: BtMessageId,
-    ext: Option<(u8, Object)>, // The extension object
+pub enum BtMessage {
+    /// No Payload
+    Choke,
+    Unchoke,
+    Interested,
+    NotInterested,
+
+    // Message have payload
+    Have { 
+        piece_index: u32 
+    },
+    Bitfield {
+        data: Vec<u8>
+    },
+    Request { 
+        index: u32, 
+        begin: u32, 
+        length: u32
+    },
+    Piece { 
+        index: u32, 
+        begin: u32, 
+        block: Vec<u8>
+    },
+    Cancel { 
+        index: u32, 
+        begin: u32, 
+        length: u32
+    },
+    Extended {
+        id: u8, 
+        msg: Object, 
+        payload: Vec<u8> // The payload behind the data
+    },
 }
 
 struct BtStreamInner {
 
 }
 
-/// The information to handshake
-#[derive(Clone)]
-pub struct BtHandshakeInfo {
-    hash      : InfoHash,
-    peer_id   : PeerId,
-    extensions: Option<Object>, // The dict, {"m": {xxx}, "v":"xxx"}
+#[derive(Clone, Debug)]
+pub struct PeerId {
+    data: [u8; 20]
 }
 
+/// The information to handshake
+#[derive(Clone, Debug)]
+pub struct BtHandshakeInfo {
+    pub hash      : InfoHash,
+    pub peer_id   : PeerId,
+    pub extensions: Option<Object>, // The dict, {"m": {xxx}, "v":"xxx"}
+}
+
+#[derive(Debug)]
 pub struct BtStream<T> {
     stream: T, // The underlying stream
+    read_buf: Vec<u8>,
+    write_buf: Vec<u8>,
     local_info: BtHandshakeInfo,
-    remote_info: BtHandshakeInfo, // The remote handshake info
+    peer_info: BtHandshakeInfo, // The remote handshake info
 }
 
 #[derive(Debug, Error)]
@@ -67,7 +107,7 @@ pub enum BtError {
     InvalidMessage,
 
     #[error("The message we received has too large len")]
-    MessageLenToLarge,
+    MessageTooLarge,
 
     #[error("NetworkError {:?}", .0)]
     NetworkError(#[from] io::Error),
@@ -78,13 +118,14 @@ mod utils {
 
     /// Helper function to write the common handshake info
     pub async fn write_handshake<T: AsyncWrite + Unpin>(stream: &mut T, info: &BtHandshakeInfo) -> io::Result<()> {
-        // LEN(1) + "Bittorrent protocol"(19) + reserved bytes(8) + infohash(20) + peerid(20)
+        // LEN(1) + "BitTorrent protocol"(19) + reserved bytes(8) + infohash(20) + peerid(20)
+        trace!("Write handshake...");
         let mut buffer = [0u8; 68];
-        let mut cursor = &mut buffer[..];
+        let mut cursor = buffer.as_mut();
 
-        // Write Bittorrent protocol
+        // Write BitTorrent protocol
         cursor[0] = BT_PROTOCOL_LEN as u8;
-        cursor[1..BT_PROTOCOL_LEN + 1].copy_from_slice(BT_PROTOCOL_STR.as_bytes());
+        cursor[1..BT_PROTOCOL_LEN + 1].copy_from_slice(BT_PROTOCOL_STR);
         cursor = &mut cursor[BT_PROTOCOL_LEN + 1..];
 
         if !info.extensions.is_none() {
@@ -97,17 +138,20 @@ mod utils {
         cursor[20..].copy_from_slice(info.peer_id.as_slice());
 
         stream.write_all(buffer.as_slice()).await?;
+        stream.flush().await?;
+        trace!("Write handshake done");
         return Ok(());
     }
 
     /// Helper function to read the common handshake
     pub async fn read_handshake<T: AsyncRead + Unpin>(stream: &mut T) -> Result<(InfoHash, PeerId, bool), BtError> {
-        // LEN(1) + "Bittorrent protocol"(19) + reserved bytes(8) + infohash(20) + peerid(20)
-        let mut buffer = [0u8, 68];
+        // LEN(1) + "BitTorrent protocol"(19) + reserved bytes(8) + infohash(20) + peerid(20)
+        trace!("Read handshake...");
+        let mut buffer = [0u8; 68];
         stream.read_exact(&mut buffer).await?;
         // Check headers
         let mut cursor = &buffer[..];
-        if cursor[0] as usize != BT_PROTOCOL_LEN ||  &cursor[1..BT_PROTOCOL_LEN + 1] != BT_PROTOCOL_STR.as_bytes() {
+        if cursor[0] as usize != BT_PROTOCOL_LEN ||  &cursor[1..BT_PROTOCOL_LEN + 1] != BT_PROTOCOL_STR {
             return Err(BtError::HandshakeFailed);
         }
         cursor = &cursor[BT_PROTOCOL_LEN + 1..];
@@ -124,111 +168,299 @@ mod utils {
         peer_id.copy_from_slice(&cursor[20..]);
 
         // All done
-        return Ok((InfoHash::from(hash), peer_id, has_ext));
-    }
-
-    pub async fn write_handshake_ext<T: AsyncWrite + Unpin>(stream: &mut T, info: &BtHandshakeInfo) -> io::Result<()> {
-        match &info.extensions {
-            None => panic!("You should not call it if the ext is none"),
-            Some(ext) => {
-                return write_message_ext(stream, 0, ext).await;
-            }
-        }
-    }
-
-    pub async fn read_handshake_ext<T: AsyncRead + Unpin>(stream: &mut T) -> Result<Object, BtError> {
-        let mut buf = Vec::new();
-        let (msg, payload) = read_message(stream, &mut buf).await?;
-        if msg.id != BtMessageId::Extended || !payload.is_empty() {
-            return Err(BtError::HandshakeFailed);
-        }
-        let (ext_id, obj) = msg.ext.unwrap();
-        if ext_id != 0 { // Not handshake
-            return Err(BtError::HandshakeFailed);
-        }
-        return Ok(obj);
+        trace!("Read hanshake(hash: {}, peer_id: {:?}, has_ext: {}", InfoHash::from(hash), PeerId::from(peer_id), has_ext);
+        return Ok((InfoHash::from(hash), PeerId::from(peer_id), has_ext));
     }
 
     // Message...
-    pub async fn write_message<T: AsyncWrite + Unpin>(stream: &mut T, id: BtMessageId, buf: &[u8]) -> io::Result<()> {
+    pub async fn write_message<T: AsyncWrite + Unpin>(stream: &mut T, buffer: &mut Vec<u8>, msg: &BtMessage) -> io::Result<()> {
         // Header u32 + u8(id)
-        let mut header = [0u8; 5];
-        let len = (buf.len() + 1) as u32; // + 1 for contains the id
-        header[0..4].copy_from_slice(len.to_be_bytes().as_slice());
-        header[4] = id as u8;
-
-        stream.write_all(header.as_slice()).await?;
-        stream.write_all(buf).await?;
+        buffer.clear();
+        msg.encode_to(buffer);
+        trace!("Write {:?} message, len {}", msg.id(), buffer.len());
+        stream.write_all(&buffer).await?;
+        stream.flush().await?;
         return Ok(());
     }
 
-    pub async fn write_message_ext<T: AsyncWrite + Unpin>(stream: &mut T, ext_id: u8, obj: &Object) -> io::Result<()> {
-        let mut vec = Vec::new();
-        vec.push(ext_id);
-        obj.encode_to(&mut vec);
-        return write_message(stream, BtMessageId::Extended, vec.as_slice()).await;
-    }
-
-    pub async fn read_message<'a, T: AsyncRead + Unpin>(stream: &mut T, buffer: &'a mut Vec<u8>) -> Result<(BtMessage, &'a [u8]), BtError> {
+    pub async fn read_message<T: AsyncRead + Unpin>(stream: &mut T, buffer: &mut Vec<u8>) -> Result<BtMessage, BtError> {
         // Header u32 + u8(id)
-        let mut header = [0u8; 4];
+        if buffer.len() < 4 {
+            buffer.resize(4, 0);
+        }
         loop {
-            stream.read_exact(&mut header).await?;
-            let len = u32::from_be_bytes(header);
+            stream.read_exact(&mut buffer[0..4]).await?;
+            let len = u32::from_be_bytes(buffer[0..4].try_into().unwrap());
             if len == 0 { // Keep alive
                 continue;
             }
-            if len > 1024 * 1024 * 50 { // 50MB, too large
-                return Err(BtError::MessageLenToLarge);
+            if len > MAX_MESSAGE_LEN { // 50MB, too large
+                return Err(BtError::MessageTooLarge);
             }
-            buffer.resize(len as usize, 0);
-            stream.read_exact(buffer.as_mut_slice()).await?;
-
-            // Parse message id
-            let raw_id = buffer[0];
-            if raw_id > 8 && raw_id != 20 {
-                return Err(BtError::InvalidMessage);
-            }
-            let id: BtMessageId = unsafe { // TAKE an short cut :), we alreay checked
-                std::mem::transmute(raw_id)
-            };
-
-            // Parse the extension id
-            let mut cursor = &buffer[1..]; // Skip the first id
-            let mut msg = BtMessage {
-                id: id,
-                ext: None,
-            };
-            if id == BtMessageId::Extended {
-                let ext_id = cursor[0];
-                let (obj, left) = match Object::decode(&cursor[1..]) {
-                    Some(val) => val,
-                    None => return Err(BtError::InvalidMessage),
-                };
-                msg.ext = Some((ext_id, obj));
-                cursor = left;
-            }
-            return Ok((msg, cursor));
+            buffer.resize((len + 4) as usize, 0);
+            stream.read_exact(&mut buffer[4..]).await?;
+            
+            let msg = BtMessage::decode(&buffer)?;
+            debug!("Read {:?} message", msg.id());
+            return Ok(msg);
         }
     }
 }
 
+impl From<[u8; 20]> for PeerId {
+    fn from(value: [u8; 20]) -> Self {
+        return Self { data: value };
+    }
+}
+
+impl TryFrom<u8> for BtMessageId {
+    type Error = BtError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => return Ok(BtMessageId::Choke),
+            1 => return Ok(BtMessageId::Unchoke),
+            2 => return Ok(BtMessageId::Interested),
+            3 => return Ok(BtMessageId::NotInterested),
+            4 => return Ok(BtMessageId::Have),
+            5 => return Ok(BtMessageId::Bitfield),
+            6 => return Ok(BtMessageId::Request),
+            7 => return Ok(BtMessageId::Piece),
+            8 => return Ok(BtMessageId::Cancel),
+            20 => return Ok(BtMessageId::Extended),
+            _ => return Err(BtError::InvalidMessage),
+        }
+    }
+}
+
+impl PeerId {
+    /// Get the slice of the peer
+    pub fn as_slice(&self) -> &[u8] {
+        return self.data.as_slice();
+    }
+
+    /// Random create an peer id
+    pub fn rand() -> PeerId {
+        let mut arr = [0u8; 20];
+        for i in &mut arr {
+            *i = fastrand::u8(..);
+        }
+        return PeerId::from(arr);
+    }
+
+    pub fn make() -> PeerId {
+        let pre = b"-IL00000-";
+        let mut id = PeerId::rand();
+        id.data[0..pre.len()].copy_from_slice(pre);
+        return id;
+    }
+}
+
+impl BtHandshakeInfo {
+    /// Query the pex extension id
+    pub fn pex_id(&self) -> Option<u8> {
+        return self.extension_id(b"ut_pex");
+    }
+
+    /// Query the metadata extension id
+    pub fn metadata_id(&self) -> Option<u8> {
+        return self.extension_id(b"ut_metadata");
+    }
+    
+    /// Query the extension id
+    pub fn extension_id(&self, key: &[u8]) -> Option<u8> {
+        // "m" : { "key": id }
+        let id = self.extensions.as_ref()?.get(b"m")?.get(key)?.as_int()?;
+        if *id < 0 || *id > 255 {
+            return None;
+        }
+        return Some(*id as u8);
+    }
+
+    /// Get the metadata size
+    pub fn metadata_size(&self) -> Option<u64> {
+        // "metadata_size" : size
+        let size = self.extensions.as_ref()?.get(b"metadata_size")?.as_int()?;
+        if *size < 0 {
+            return None;
+        }
+        return Some(*size as u64);
+    }
+
+    /// Set the extension id by key and value
+    pub fn set_extension_id(&mut self, key: &[u8], id: u8) {
+        // "m" : { "key": id }
+        if self.extensions.is_none() { // Init, make new dict
+            let dict = BTreeMap::from([
+                (b"m".to_vec(), Object::from(BTreeMap::new()))
+            ]);
+            self.extensions = Some(Object::from(dict));
+        }
+        let dict = self.extensions.as_mut().unwrap().as_mut_dict().unwrap();
+        let dict = dict.get_mut(b"m".as_slice()).expect("It should has m key").as_mut_dict().expect("The m value should is dict");
+        dict.insert(key.to_vec(), Object::from(id as i64));
+    }
+
+    pub fn set_pex_id(&mut self, id: u8) {
+        self.set_extension_id(b"ut_pex", id);
+    }
+
+    pub fn set_metadata_id(&mut self, id: u8) {
+        self.set_extension_id(b"ut_metadata", id);
+    }
+
+}
+
+impl BtMessage {
+    /// Get the id of the message
+    pub fn id(&self) -> BtMessageId {
+        return match self {
+            BtMessage::Choke => BtMessageId::Choke,
+            BtMessage::Unchoke => BtMessageId::Unchoke,
+            BtMessage::Interested => BtMessageId::Interested,
+            BtMessage::NotInterested => BtMessageId::NotInterested,
+            BtMessage::Have {..} => BtMessageId::Have,
+            BtMessage::Bitfield {..} => BtMessageId::Bitfield,
+            BtMessage::Request {..} => BtMessageId::Request,
+            BtMessage::Piece {..} => BtMessageId::Piece,
+            BtMessage::Cancel {..} => BtMessageId::Cancel,
+            BtMessage::Extended {..} => BtMessageId::Extended,
+        }
+    }
+
+    /// Encode the message to vector
+    pub fn encode_to(&self, out: &mut Vec<u8>) {
+        // Header u32(len, contains this id) + u8(id)
+        let pos = out.len();
+        out.extend_from_slice(&[0u8; 4]); // As placeholder for the len
+        out.push(self.id() as u8);
+
+        let len = match self {
+            BtMessage::Have { piece_index } => {
+                let bytes = piece_index.to_be_bytes();
+                out.extend_from_slice(&bytes);
+                
+                bytes.len()
+            },
+            BtMessage::Bitfield { data } => {
+                out.extend_from_slice(data);
+
+                data.len()
+            },
+            BtMessage::Request {..} => todo!(),
+            BtMessage::Piece {..} => todo!(),
+            BtMessage::Cancel {..} => todo!(),
+            BtMessage::Extended {id, msg, payload} => {
+                let cur_len = out.len();
+                out.push(*id);
+                msg.encode_to(out);
+                out.extend_from_slice(payload);
+
+                out.len() - cur_len
+            },
+            // Another message doesnot have payload
+            _ => 0,
+        } + 1; // +1 for contains the id
+
+        // Set the len
+        out[pos..pos + 4].copy_from_slice(&(len as u32).to_be_bytes());
+    }
+
+    /// Decode the message from slice
+    pub fn decode(bytes: &[u8]) -> Result<BtMessage, BtError> {
+        // Header u32(len, contains this id) + u8(id)
+        if bytes.len() < 5 { // Al least 5
+            return Err(BtError::HandshakeFailed);
+        }
+        let len = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
+        let id: BtMessageId = bytes[4].try_into()?;
+
+        if len < 1{
+            return Err(BtError::InvalidMessage);
+        }
+        if len > MAX_MESSAGE_LEN { // 50MB, too large
+            return Err(BtError::MessageTooLarge);
+        }
+
+        // Move to the payload begin
+        let payload = &bytes[5..];
+
+        match id {
+            BtMessageId::Choke => return Ok(BtMessage::Choke),
+            BtMessageId::Unchoke => return Ok(BtMessage::Unchoke),
+            BtMessageId::Interested => return Ok(BtMessage::Interested),
+            BtMessageId::NotInterested => return Ok(BtMessage::NotInterested),
+            
+            // Have payload
+            BtMessageId::Have => {
+                let data: [u8; 4] = match payload.try_into() {
+                    Ok(val) => val,
+                    Err(_) => return Err(BtError::InvalidMessage),
+                };
+                return Ok(BtMessage::Have { piece_index: u32::from_be_bytes(data) });
+            },
+            BtMessageId::Bitfield => {
+                let data = Vec::from(payload);
+                return Ok(BtMessage::Bitfield { data: data });
+            },
+            BtMessageId::Request => todo!("impl Request"),
+            BtMessageId::Piece => todo!("impl Piece"),
+            BtMessageId::Cancel => todo!("impl Cancel"),
+            BtMessageId::Extended => {
+                if payload.len() < 3 { // At least need extension id and an empty dict
+                    return Err(BtError::InvalidMessage);
+                }
+                let ext_id = payload[0];
+                let (msg, left) = match Object::decode(&payload[1..]) {
+                    Some(val) => val,
+                    None => return Err(BtError::InvalidMessage),
+                };
+                return Ok(BtMessage::Extended { id: ext_id, msg: msg, payload: Vec::from(left) });
+            },
+        }
+    }
+
+}
+
 impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
 
-    // Handshake like an client
-    pub async fn client_handshake(mut stream: T, info: &BtHandshakeInfo) -> Result<BtStream<T> , BtError> {
+    pub fn peer_info(&self) -> &BtHandshakeInfo {
+        return &self.peer_info;
+    }
+
+    pub fn local_info(&self) -> &BtHandshakeInfo {
+        return &self.local_info;
+    }
+
+    /// Handshake like an client
+    pub async fn client_handshake(mut stream: T, info: BtHandshakeInfo) -> Result<BtStream<T> , BtError> {
         utils::write_handshake(&mut stream, &info).await?;
         let (info_hash, peer_id, has_ext) = utils::read_handshake(&mut stream).await?;
         if info_hash != info.hash { // Info Hash mismatch
             return Err(BtError::HandshakeFailed);
         }
-        
+        let mut read_buf = Vec::new();
+        let mut write_buf = Vec::new();
+
         // Begin the ext handshake
-        let extensions = if has_ext {
-            utils::write_handshake_ext(&mut stream, &info).await?;
-            let obj = utils::read_handshake_ext(&mut stream).await?;
-            
-            Some(obj)
+        let extensions = if has_ext && info.extensions.is_some() {
+            // Write our handle shake out
+            let out_msg = BtMessage::Extended { id: 0, msg: info.extensions.as_ref().unwrap().clone(), payload: Vec::new() };
+            utils::write_message(&mut stream, &mut write_buf, &out_msg).await?;
+
+            // Read the handleshake
+            let in_msg = utils::read_message(&mut stream, &mut read_buf).await?;
+
+            // Check it
+            match in_msg {
+                BtMessage::Extended { id, msg, payload } => {
+                    if id != 0 || !payload.is_empty() {
+                        return Err(BtError::HandshakeFailed);
+                    }
+                    Some(msg)
+                },
+                _ => return Err(BtError::HandshakeFailed),
+            }
         }
         else {
             None
@@ -237,8 +469,10 @@ impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
         return Ok(
             BtStream {
                 stream: stream,
-                local_info: info.clone(),
-                remote_info: BtHandshakeInfo {
+                read_buf: read_buf,
+                write_buf: write_buf,
+                local_info: info,
+                peer_info: BtHandshakeInfo {
                     hash: info_hash,
                     peer_id: peer_id,
                     extensions: extensions
@@ -247,13 +481,85 @@ impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
         );
     }
 
-    pub async fn read_message<'a>(&mut self, buffer: &'a mut Vec<u8>) -> Result<(BtMessage, &'a [u8]), BtError> {
-        return utils::read_message(&mut self.stream, buffer).await;
+    /// Read an message from the stream
+    pub async fn read_message(&mut self) -> Result<BtMessage, BtError> {
+        return utils::read_message(&mut self.stream, &mut self.read_buf).await;
     }
 
-    // pub async fn write_message(&mut self, msg: &BtMessage, payload: &[u8]) -> io::Result<()> {
-    //     if msg.id == BtMessageId::Extended {
 
-    //     }
-    // }
+    /// Write an message to the stream
+    pub async fn write_message(&mut self, msg: &BtMessage) -> io::Result<()> {
+        return utils::write_message(&mut self.stream, &mut self.write_buf, &msg).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing::error;
+    use tokio::{net};
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_bt_stream() -> Result<(), BtError> {
+        // Test on my bittorrent
+        let stream = net::TcpStream::connect("127.0.0.1:35913").await?;
+        let info = BtHandshakeInfo {
+            hash: InfoHash::from_hex("4ce5c1ec28454f6f0e5c009e74df3a62a9efafa8").unwrap(),
+            peer_id: PeerId::make(),
+            extensions: Some(
+                Object::from([
+                    (b"m".to_vec(), Object::from([(b"ut_metadata".to_vec(), Object::from(1))])),
+                    (b"v".to_vec(), Object::from(b"Test BitTorrent"))
+                ])
+            )
+        };
+        // TODO:_
+        let mut bt_stream = BtStream::client_handshake(stream, info).await?;
+        let metadata_size = match bt_stream.peer_info().metadata_size() {
+            Some(val) => val,
+            None => panic!("It should have size"),
+        };
+        let peer_metadata_id = match bt_stream.peer_info().metadata_id() {
+            Some(val) => val,
+            None => panic!("It should have size"),
+        };
+        let pieces = (metadata_size + 16383) / 16384; // 16KB per piece
+        let mut torrent = Vec::new();
+        for i in 0..pieces {
+            // // Request it
+            let obj = Object::from([
+                (b"msg_type".to_vec(), Object::from(0)), // 0 on request
+                (b"piece".to_vec(), Object::from(i as i64))
+            ]);
+            
+            bt_stream.write_message(&BtMessage::Extended { id: peer_metadata_id, msg: obj, payload: Vec::new() }).await?;
+            loop {
+                let (id, msg, payload) = match bt_stream.read_message().await? {
+                    BtMessage::Extended { id, msg, payload } => (id, msg, payload),
+                    _ => continue,
+                };
+                if id != 1 {
+                    continue; // Ignore
+                }
+                let msg_type = msg.get(b"msg_type").unwrap().as_int().unwrap();
+                let piece = msg.get(b"piece").unwrap().as_int().unwrap();
+                if *msg_type != 1 || *piece != i as i64 { // It does provide it
+                    error!("WTF, mismatch");
+                    return Ok(());
+                }
+
+                // Copy into it
+                torrent.extend_from_slice(payload.as_slice());
+                break;
+            }
+        }
+        // Try to decode it
+        let (obj, _) = match Object::decode(torrent.as_slice()) {
+            Some(val) => val,
+            None => return Ok(()),
+        };
+        debug!("Got torrent {:?}", obj);
+        return Ok(());
+    }
 }

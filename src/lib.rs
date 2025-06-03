@@ -9,3 +9,16 @@ pub use core::InfoHash;
 pub fn hello_world() {
     println!("Hello world");
 }
+
+#[cfg(test)]
+mod tests {
+    use ctor::ctor;
+    #[ctor]
+    fn init() {
+        color_backtrace::install();
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_thread_ids(true)
+            .try_init();
+    }
+}

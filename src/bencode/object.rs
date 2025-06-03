@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap};
 
 #[derive(PartialEq, Eq, Debug, Clone)]
 pub enum Object {
@@ -58,7 +58,41 @@ impl Object {
         }
     }
 
-    // Parse any bencoded input
+    // Cast mut
+    pub fn as_mut_int(&mut self) -> Option<&mut i64> {
+        return match self {
+            Object::Int(i) => Some(i),
+            _ => None
+        }
+    }
+
+    pub fn as_mut_string(&mut self) -> Option<&mut Vec<u8> > {
+        return match self {
+            Object::String(s) => Some(s),
+            _ => None
+        }
+    }
+
+    pub fn as_mut_list(&mut self) -> Option<&mut Vec<Object> > {
+        return match self {
+            Object::List(list) => Some(list),
+            _ => None
+        }
+    }
+
+    pub fn as_mut_dict(&mut self) -> Option<&mut BTreeMap<Vec<u8>, Object> > {
+        return match self {
+            Object::Dict(dict) => Some(dict),
+            _ => None
+        }
+    }
+
+    /// Get the dict object value by key, it will check if it is dict
+    pub fn get(&self, key: &[u8]) -> Option<&Object> {
+        return self.as_dict()?.get(key);
+    }
+
+    /// Parse any bencoded input
     pub fn decode(bytes: &[u8]) -> Option<(Object, &[u8])> {
         return match bytes.first()? {
             b'0'..=b'9' => Object::decode_string(bytes),
@@ -69,7 +103,7 @@ impl Object {
         }
     }
 
-    // Parse int, input like i11e
+    /// Parse int, input like i11e
     pub fn decode_int(mut bytes: &[u8]) -> Option<(Object, &[u8])> {
         if *bytes.first()? != b'i' {
             return None;
@@ -85,7 +119,7 @@ impl Object {
         return Some((Object::Int(num), bytes));
     }
 
-    // Parse string, input like 4:aaaa
+    /// Parse string, input like 4:aaaa
     pub fn decode_string(mut bytes: &[u8]) -> Option<(Object, &[u8])> {
         // Get the string length
         let (strlen, left) = parse_int(bytes)?;
@@ -102,7 +136,7 @@ impl Object {
         return Some((Object::String(vec), left));
     }
 
-    // Parse list, input like l4:spame
+    /// Parse list, input like l4:spame
     pub fn decode_list(mut bytes: &[u8]) -> Option<(Object, &[u8])> {
         if *bytes.first()? != b'l' {
             return None;
@@ -118,7 +152,7 @@ impl Object {
         return Some((Object::List(list), bytes));
     }
 
-    // Parse dict, input like d1:s2:sse
+    /// Parse dict, input like d1:s2:sse
     pub fn decode_dict(mut bytes: &[u8]) -> Option<(Object, &[u8])> {
         if *bytes.first()? != b'd' {
             return None;
@@ -192,6 +226,12 @@ impl From<&[u8]> for Object {
     }
 }
 
+impl From<&str> for Object {
+    fn from(item: &str) -> Self {
+        return Object::String(item.as_bytes().to_vec());
+    }
+}
+
 impl From<Vec<u8> > for Object {
     fn from(item: Vec<u8>) -> Self {
         return Object::String(item);
@@ -210,6 +250,27 @@ impl From<BTreeMap<Vec<u8>, Object> > for Object {
     }
 }
 
+// To String
+impl<const N: usize> From<&[u8; N]> for Object {
+    fn from(value: &[u8; N]) -> Self {
+        return Object::String(value.to_vec());
+    }
+}
+
+// To List
+impl<const N: usize> From<[Object; N]> for Object {
+    fn from(value: [Object; N]) -> Self {
+        return Object::List(Vec::from(value));
+    }
+}
+
+// To Dict
+impl<const N: usize> From<[(Vec<u8>, Object); N]> for Object {
+    /// Create an dict object from the array of key and value
+    fn from(arr: [(Vec<u8>, Object); N]) -> Self {
+        return Object::Dict(BTreeMap::from(arr));
+    }
+}
 
 #[cfg(test)]
 mod tests {

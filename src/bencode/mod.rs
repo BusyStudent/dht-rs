@@ -1,2 +1,2 @@
-pub mod object;
+mod object;
 pub use object::Object;

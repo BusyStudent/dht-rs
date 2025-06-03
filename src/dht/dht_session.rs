@@ -453,16 +453,6 @@ impl DhtSession {
 mod tests {
     use super::*;
     use tokio::{io, net};
-    use ctor::ctor;
-
-    #[ctor]
-    fn init() {
-        color_backtrace::install();
-        tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .with_thread_ids(true)
-            .init();
-    }
 
     #[tokio::test]
     #[ignore]
