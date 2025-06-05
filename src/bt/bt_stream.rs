@@ -495,6 +495,8 @@ impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
 
 #[cfg(test)]
 mod tests {
+    use crate::bt::UtMetadataMessage;
+
     use super::*;
     use tracing::error;
     use tokio::{net};
@@ -527,13 +529,9 @@ mod tests {
         let pieces = (metadata_size + 16383) / 16384; // 16KB per piece
         let mut torrent = Vec::new();
         for i in 0..pieces {
-            // // Request it
-            let obj = Object::from([
-                (b"msg_type".to_vec(), Object::from(0)), // 0 on request
-                (b"piece".to_vec(), Object::from(i as i64))
-            ]);
-            
-            bt_stream.write_message(&BtMessage::Extended { id: peer_metadata_id, msg: obj, payload: Vec::new() }).await?;
+            // Request it
+            let request = UtMetadataMessage::Request { piece: i };
+            bt_stream.write_message(&BtMessage::Extended { id: peer_metadata_id, msg: request.to_bencode(), payload: Vec::new() }).await?;
             loop {
                 let (id, msg, payload) = match bt_stream.read_message().await? {
                     BtMessage::Extended { id, msg, payload } => (id, msg, payload),
@@ -542,11 +540,18 @@ mod tests {
                 if id != 1 {
                     continue; // Ignore
                 }
-                let msg_type = msg.get(b"msg_type").unwrap().as_int().unwrap();
-                let piece = msg.get(b"piece").unwrap().as_int().unwrap();
-                if *msg_type != 1 || *piece != i as i64 { // It does provide it
-                    error!("WTF, mismatch");
-                    return Ok(());
+                let ut_msg = UtMetadataMessage::from_bencode(&msg).unwrap(); // I don't want to check it, it just as a test
+                match ut_msg {
+                    UtMetadataMessage::Data { piece, total_size: _ } => {
+                        if piece != i {
+                            error!("Got wrong piece {piece}");
+                            break;
+                        }
+                    },
+                    _ => {
+                        error!("Got wrong message {ut_msg:?}");
+                        return Err(BtError::InvalidMessage);
+                    }
                 }
 
                 // Copy into it

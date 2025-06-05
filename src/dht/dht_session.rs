@@ -7,15 +7,18 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
 
-use super::{NodeId, RoutingTable};
-use super::krpc::*;
+use crate::{NodeId, core::RoutingTable};
+use crate::krpc::*;
 
 const KRPC_TIMEOUT_DRUATION: Duration = Duration::from_secs(3); // The default timeout of krpc
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60); // The minimum interval for node refresh
+const MIN_CLEAR_INTERVAL: Duration = Duration::from_secs(60 * 15); // The minimum interval for clear the peers announced
 const NUM_QUERIES_PER_ITERATION: usize = 3; // The queries of per iterations
 const MAX_ITERATIONS_WITH_CONVERGENCE: usize = 3; // The max iterations with convergence
 const MAX_ITERATIONS: usize = 16; // The max iterations of the find_node / get_peers
 const MAX_ALPHA: usize = 10; // Use more cocorrent requests, to speed up the process
+
+type OnPeerAnnounceCallback = Box<dyn Fn(InfoHash, SocketAddr) + Send>;
 
 struct DhtSessionInner {
     routing_table: Mutex<RoutingTable>,
@@ -24,6 +27,7 @@ struct DhtSessionInner {
     id: NodeId, // The self id
     ipv4: bool, // does it run on ipv4? ,false on ipv6
     timeout: Duration, // The timeout for the all krpc requests
+    on_peer_announce: Mutex<Option<OnPeerAnnounceCallback> >  // The callback on the peer announced
 }
 
 #[derive(Clone)]
@@ -87,6 +91,7 @@ impl DhtSession {
                     id: id,
                     ipv4: ipv4,
                     timeout: KRPC_TIMEOUT_DRUATION,
+                    on_peer_announce: Mutex::new(None),
                 }
             )
         };
@@ -329,6 +334,14 @@ impl DhtSession {
                 };
                 let _ = self.inner.krpc.send_reply(tid, reply, ip).await;
 
+                // Check if we have callback, and than invoke it
+                {
+                    let opt = self.inner.on_peer_announce.lock().expect("Mutex poisoned");
+                    if let Some(cb) = opt.as_ref() {
+                        cb(query.info_hash, peer_ip);
+                    }
+                }
+
                 query.id
             },
             _ => {
@@ -344,6 +357,11 @@ impl DhtSession {
         trace!("Received query method {} from {}: {} ", String::from_utf8_lossy(method), id, ip);
         let _ = self.routing_table_mut().update_node(id, ip);
         return true;
+    }
+
+    /// Set the callback handler for peer announce
+    pub fn set_on_peer_announce(&mut self, cb : OnPeerAnnounceCallback) {
+        self.inner.on_peer_announce.lock().expect("Mutex poisoned").replace(cb);
     }
 
     async fn bootstrap(&self) -> bool {
@@ -435,7 +453,15 @@ impl DhtSession {
         }
     }
 
-    pub async fn run(&self) {
+    async fn clear_peers(&self) {
+        loop {
+            tokio::time::sleep(MIN_CLEAR_INTERVAL).await;
+            self.inner.peers.lock().expect("Mutex poisoned").clear();
+            debug!("Clear the peers we have");
+        }
+    }
+
+    async fn main_loop(&self) {
         // Doing the bootstrap
         loop {
             if !self.bootstrap().await {
@@ -446,6 +472,10 @@ impl DhtSession {
             debug!("DHT session bootstrap done, routing table {:?}", self.routing_table_mut());
             self.refresh_routing_table().await;
         }
+    }
+
+    pub async fn run(&self) {
+        tokio::join!(self.main_loop(), self.clear_peers());
     }
 }
 
