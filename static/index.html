@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DHT Crawler - 控制面板</title>
+    <style>
+        /* --- 基本样式 --- */
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f0f2f5;
+            color: #333;
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* --- 左侧 Tab 导航 --- */
+        .tab-container {
+            flex: 0 0 180px;
+            background-color: #2c3e50;
+            padding: 20px 0;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .tab-button {
+            background-color: transparent;
+            color: #ecf0f1;
+            border: none;
+            padding: 15px 20px;
+            width: 100%;
+            text-align: left;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.3s, color 0.3s;
+            border-left: 4px solid transparent;
+        }
+
+        .tab-button:hover {
+            background-color: #34495e;
+        }
+
+        .tab-button.active {
+            background-color: #3498db;
+            color: #ffffff;
+            border-left: 4px solid #ffffff;
+        }
+        
+        /* --- 右侧内容区域 --- */
+        .content-container {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .tab-content {
+            display: none;
+            height: 100%;
+            flex-direction: column;
+        }
+
+        .tab-content.active {
+            display: flex;
+        }
+
+        /* --- 通用组件样式 --- */
+        h2 {
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 10px;
+            color: #2c3e50;
+            margin-top: 0;
+        }
+
+        .button {
+            background-color: #3498db;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background-color 0.2s;
+        }
+
+        .button:hover {
+            background-color: #2980b9;
+        }
+
+        .button.danger {
+            background-color: #e74c3c;
+        }
+        .button.danger:hover {
+            background-color: #c0392b;
+        }
+
+        input[type="text"], input[type="number"] {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+
+        /* --- 特定界面样式 --- */
+
+        /* 主界面 */
+        #log-window {
+            flex: 1; /* 占据剩余空间 */
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            padding: 10px;
+            overflow-y: scroll;
+            font-family: "Courier New", Courier, monospace;
+            white-space: pre-wrap;
+        }
+
+        /* 路由表 */
+        #routing-table-list {
+            list-style-type: none;
+            padding: 0;
+            background-color: #fff;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            flex: 1;
+            overflow-y: auto;
+        }
+        #routing-table-list li {
+            padding: 8px 12px;
+            border-bottom: 1px solid #eee;
+        }
+        #routing-table-list li:last-child {
+            border-bottom: none;
+        }
+        
+        /* 元数据查找 */
+        #metadata-content .scrollable-area {
+            flex: 1;
+            overflow-y: auto;
+            padding-right: 15px; /* for scrollbar */
+        }
+        #search-results {
+            margin-top: 20px;
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 15px;
+        }
+
+        .torrent-card {
+            background-color: #fff;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 15px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+        }
+        .torrent-card.minimal {
+            background-color: #f9f9f9;
+        }
+        .torrent-card h4 {
+            margin: 0 0 10px 0;
+            word-break: break-all;
+            color: #2c3e50;
+        }
+        .torrent-card.minimal h4 {
+            color: #7f8c8d;
+            font-style: italic;
+        }
+        .torrent-card .info-hash {
+            font-family: monospace;
+            font-size: 12px;
+            color: #555;
+            word-break: break-all;
+            margin-bottom: 15px;
+        }
+        .torrent-card .actions {
+            margin-top: auto;
+            display: flex;
+            gap: 10px;
+        }
+        .torrent-card .actions .button {
+            flex: 1;
+            padding: 8px;
+            font-size: 14px;
+        }
+        .torrent-card .file-list {
+            display: none;
+            margin-top: 10px;
+            padding-left: 20px;
+            max-height: 150px;
+            overflow-y: auto;
+            font-size: 14px;
+            border-top: 1px dashed #ccc;
+            padding-top: 10px;
+        }
+
+        /* 翻页控件 */
+        #pagination-controls {
+            margin-top: 20px;
+            padding-bottom: 20px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 5px;
+        }
+        .pagination-link {
+            padding: 8px 12px;
+            border: 1px solid #ddd;
+            background-color: #fff;
+            color: #3498db;
+            text-decoration: none;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        .pagination-link:hover {
+            background-color: #f0f0f0;
+        }
+        .pagination-link.active {
+            background-color: #3498db;
+            color: white;
+            border-color: #3498db;
+        }
+        .pagination-link.disabled {
+            color: #aaa;
+            cursor: not-allowed;
+            background-color: #f5f5f5;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- 左侧 Tab 栏 -->
+    <div class="tab-container">
+        <button class="tab-button active" onclick="showTab('main')">主界面</button>
+        <button class="tab-button" onclick="showTab('routing')">路由表</button>
+        <button class="tab-button" onclick="showTab('metadata')">元数据查找</button>
+        <button class="tab-button" onclick="showTab('settings')">设置</button>
+    </div>
+
+    <!-- 右侧内容区 -->
+    <div class="content-container">
+        <!-- 主界面 -->
+        <div id="main-content" class="tab-content active">
+            <h2>主界面</h2>
+            <div>
+                <button id="start-btn" class="button">启动爬虫</button>
+                <button id="stop-btn" class="button danger" style="display: none;">停止爬虫</button>
+            </div>
+            <h3 style="margin-top: 20px; margin-bottom: 10px;">日志输出</h3>
+            <div id="log-window"></div>
+        </div>
+
+        <!-- 路由表 -->
+        <div id="routing-content" class="tab-content">
+            <h2>路由表 (K-Buckets)</h2>
+            <p>当前路由表中的节点数量: <span id="node-count">0</span></p>
+            <ul id="routing-table-list"></ul>
+        </div>
+
+        <!-- 元数据查找 -->
+        <div id="metadata-content" class="tab-content">
+            <h2>元数据查找</h2>
+            <input type="text" id="search-input" placeholder="输入 Info Hash 或 种子名称关键字，停止输入后自动搜索...">
+            <div class="scrollable-area">
+                <div id="search-results"></div>
+            </div>
+            <div id="pagination-controls"></div>
+        </div>
+
+        <!-- 设置 -->
+        <div id="settings-content" class="tab-content">
+            <h2>设置</h2>
+            <div class="form-group">
+                <label for="webui-port-input">WebUI 绑定端口</label>
+                <input type="number" id="webui-port-input" placeholder="例如: 10721 Ciallo～(∠・ω< )">
+            </div>
+            <div class="form-group">
+                <label for="bind-addr-input">DHT 绑定地址</label>
+                <input type="text" id="bind-addr-input" placeholder="不可以为空">
+            </div>
+            <div class="form-group">
+                <label for="node-id-input">节点ID (Node ID)</label>
+                <input type="text" id="node-id-input" placeholder="留空则自动生成">
+            </div>
+            <button id="save-settings-btn" class="button">保存设置</button>
+        </div>
+    </div>
+
+<script>
+    // --- 全局变量和初始化 ---
+    let searchDebounceTimer; // 用于搜索防抖的计时器
+    let currentQuery = '';   // 当前搜索的关键词
+    let currentPage = 1;     // 当前搜索的页码
+
+    document.addEventListener('DOMContentLoaded', () => {
+        loadSettings();
+        addLog("欢迎使用 DHT Crawler 控制面板。");
+        addLog("前端界面已就绪，等待与后端交互。");
+        setupEventListeners();
+    });
+
+    // --- Tab 切换逻辑 ---
+    function showTab(tabName) {
+        document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+        document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
+        document.getElementById(`${tabName}-content`).classList.add('active');
+        document.querySelector(`.tab-button[onclick="showTab('${tabName}')"]`).classList.add('active');
+        if (tabName === 'routing') updateRoutingTable();
+    }
+
+    // --- 事件监听器设置 ---
+    function setupEventListeners() {
+        // 启动/停止
+        document.getElementById('start-btn').addEventListener('click', () => {
+            startCrawler();
+        });
+        document.getElementById('stop-btn').addEventListener('click', () => {
+            stopCrawler();
+        });
+
+        // 搜索框输入（防抖）
+        document.getElementById('search-input').addEventListener('input', (e) => {
+            clearTimeout(searchDebounceTimer);
+            const query = e.target.value.trim();
+            searchDebounceTimer = setTimeout(() => {
+                if (query !== currentQuery) {
+                    currentQuery = query;
+                    searchMetadata(1); // 新的搜索总是从第一页开始
+                }
+            }, 250); // 停止输入250ms后触发
+        });
+
+        // 保存设置
+        document.getElementById('save-settings-btn').addEventListener('click', saveSettings);
+
+        // 搜索结果区域的事件委托
+        document.getElementById('search-results').addEventListener('click', (e) => {
+            const target = e.target.closest('button[data-action]');
+            if (!target) return;
+            const action = target.dataset.action;
+            const hash = target.dataset.hash;
+            if (action === 'copy-hash') {
+                navigator.clipboard.writeText(hash).then(() => alert(`Info Hash 已复制: ${hash}`));
+            }
+            if (action === 'copy-magnet') {
+                const magnet = `magnet:?xt=urn:btih:${hash}`;
+                navigator.clipboard.writeText(magnet).then(() => alert(`磁力链接已复制: ${magnet}`));
+            }
+            if (action === 'toggle-files') {
+                const fileList = target.closest('.torrent-card').querySelector('.file-list');
+                fileList.style.display = fileList.style.display === 'none' ? 'block' : 'none';
+            }
+        });
+
+        // 翻页控件的事件委托
+        document.getElementById('pagination-controls').addEventListener('click', (e) => {
+            e.preventDefault();
+            const target = e.target.closest('.pagination-link');
+            if (!target || target.classList.contains('disabled') || target.classList.contains('active')) {
+                return;
+            }
+            const page = parseInt(target.dataset.page, 10);
+            searchMetadata(page);
+        });
+    }
+
+    // --- 与后端交互的函数 ---
+
+    // ... (startCrawler, stopCrawler, addLog, updateRoutingTable 函数与之前版本相同，此处省略以保持简洁)
+    async function startCrawler() {
+        if (document.getElementById('start-btn').style.display === 'none') {
+            return; // 早就有个任务在启动了
+        }
+        addLog("正在尝试启动爬虫...");
+        try {
+            const response = await fetch('/api/v1/start_dht');
+            if (!response.ok) {
+                addLog(`不能连接到后端 因为 ${response.statusText}`);
+                return;
+            }
+            const data = await response.text();
+            addLog(`后端返回: ${data}`);
+
+            // 显示停止按钮，隐藏开始按钮
+            document.getElementById('start-btn').style.display = 'none';
+            document.getElementById('stop-btn').style.display = 'inline-block';
+        }
+        catch (e) {
+            console.log(e);
+        }
+    }
+    async function stopCrawler() {
+        if (document.getElementById('stop-btn').style.display === 'none') {
+            return; // 早就有个任务在停止了
+        }
+        addLog("正在发送停止请求...");
+        try {
+            const response = await fetch('/api/v1/stop_dht');
+            if (!response.ok) {
+                addLog(`不能连接到后端 因为 ${response.statusText}`);
+                return;
+            }
+            const data = await response.text();
+            addLog(`后端返回: ${data}`);
+
+            // 显示开始按钮，隐藏停止按钮
+            document.getElementById('stop-btn').style.display = 'none';
+            document.getElementById('start-btn').style.display = 'inline-block';
+        }
+        catch (e) {
+            console.log(e);
+        }
+    }
+    function addLog(message) {
+        const logWindow = document.getElementById('log-window');
+        const timestamp = new Date().toLocaleTimeString();
+        logWindow.innerHTML += `[${timestamp}] ${message}\n`;
+        logWindow.scrollTop = logWindow.scrollHeight;
+    }
+    async function updateRoutingTable() {
+        const list = document.getElementById('routing-table-list');
+        const countSpan = document.getElementById('node-count');
+        list.innerHTML = '<li>正在从后端获取数据...</li>';
+        setTimeout(() => {
+            const mockNodes = ['a1b2c3d4... | 192.168.1.10:6881','e5f6g7h8... | 8.8.8.8:6881','i9j0k1l2... | 202.108.22.5:12345'];
+            list.innerHTML = mockNodes.map(node => `<li>${node}</li>`).join('');
+            countSpan.textContent = mockNodes.length;
+        }, 1000);
+    }
+    // ...
+
+    /**
+     * 元数据查找: 执行搜索 (支持翻页)
+     * @param {number} page - 要请求的页码
+     */
+    async function searchMetadata(page = 1) {
+        currentPage = page;
+        const resultsContainer = document.getElementById('search-results');
+
+        if (!currentQuery) {
+            resultsContainer.innerHTML = '';
+            renderPaginationControls(0, 0);
+            return;
+        }
+
+        resultsContainer.innerHTML = '<p>正在搜索, 请稍候...</p>';
+        renderPaginationControls(0, 0); // 清空旧的翻页
+
+        // TODO: 向后端发送带分页的搜索请求, POST /search
+        // 你的后端API需要支持接收页码参数, 并返回总页数
+        // fetch('/search', {
+        //     method: 'POST',
+        //     headers: { 'Content-Type': 'application/json' },
+        //     body: JSON.stringify({ query: currentQuery, page: currentPage })
+        // })
+        // .then(response => response.json())
+        // .then(data => { // 假设后端返回 { results: [...], totalPages: 10, currentPage: 1 }
+        //     displaySearchResults(data.results);
+        //     renderPaginationControls(data.totalPages, data.currentPage);
+        // })
+        // .catch(err => {
+        //     resultsContainer.innerHTML = `<p>搜索失败: ${err}</p>`;
+        // });
+
+        // 模拟搜索结果
+        console.log(`正在模拟搜索: "${currentQuery}", 第 ${currentPage} 页`);
+        setTimeout(() => {
+             const mockFullData = {
+                results: [
+                    {
+                        name: 'ubuntu-22.04.3-desktop-amd64.iso',
+                        info_hash: 'f8c0e6e7d4b3a299f1e9a217c5b3f0e8a1c2b3d4',
+                        size: '4.7 GB',
+                        files: [{ name: 'ubuntu.iso', size: '4.7 GB' }, { name: 'README.txt', size: '1.2 KB' }]
+                    },
+                    { // 新增：只有 hash 的情况
+                        info_hash: 'aabbccddeeff00112233445566778899aabbccdd'
+                    },
+                    {
+                        name: '[Tears of Steel] a short film by the Blender Foundation',
+                        info_hash: 'd8c0e6e7d4b3a299f1e9a217c5b3f0e8a1c2b3d9',
+                        size: '522 MB',
+                        files: [{ name: 'Tears of Steel.mp4', size: '520 MB' }, { name: 'poster.jpg', size: '2 MB' }]
+                    }
+                ],
+                totalPages: 5,
+                currentPage: currentPage
+            };
+            displaySearchResults(mockFullData.results);
+            renderPaginationControls(mockFullData.totalPages, mockFullData.currentPage);
+        }, 800);
+    }
+    
+    /**
+     * 元数据查找: 显示搜索结果 (适配纯hash)
+     * @param {Array} results - 搜索结果数组
+     */
+    function displaySearchResults(results) {
+        const container = document.getElementById('search-results');
+        container.innerHTML = '';
+
+        if (!results || results.length === 0) {
+            container.innerHTML = '<p>没有找到相关结果。</p>';
+            return;
+        }
+
+        results.forEach(item => {
+            let cardHTML;
+            if (item.name) { // 有完整元数据
+                const fileListHTML = item.files.map(file => `<li>${file.name} (${file.size})</li>`).join('');
+                cardHTML = `
+                    <div class="torrent-card">
+                        <h4>${item.name}</h4>
+                        <p class="info-hash">Hash: ${item.info_hash}</p>
+                        <div class="actions">
+                            <button class="button" data-action="copy-hash" data-hash="${item.info_hash}">复制Hash</button>
+                            <button class="button" data-action="copy-magnet" data-hash="${item.info_hash}">复制磁力</button>
+                            <button class="button" data-action="toggle-files">查看文件</button>
+                        </div>
+                        <ul class="file-list" style="display: none;">${fileListHTML}</ul>
+                    </div>
+                `;
+            } else { // 只有 info_hash
+                cardHTML = `
+                    <div class="torrent-card minimal">
+                        <h4>元数据待获取</h4>
+                        <p class="info-hash">Hash: ${item.info_hash}</p>
+                        <div class="actions">
+                            <button class="button" data-action="copy-hash" data-hash="${item.info_hash}">复制Hash</button>
+                            <button class="button" data-action="copy-magnet" data-hash="${item.info_hash}">复制磁力</button>
+                        </div>
+                    </div>
+                `;
+            }
+            container.innerHTML += cardHTML;
+        });
+    }
+
+    /**
+     * 渲染翻页控件
+     * @param {number} totalPages - 总页数
+     * @param {number} currentPage - 当前页码
+     */
+    function renderPaginationControls(totalPages, currentPage) {
+        const container = document.getElementById('pagination-controls');
+        if (totalPages <= 1) {
+            container.innerHTML = '';
+            return;
+        }
+
+        let html = '';
+        // 上一页
+        html += `<a href="#" class="pagination-link ${currentPage === 1 ? 'disabled' : ''}" data-page="${currentPage - 1}">上一页</a>`;
+
+        // 页码
+        // 简单逻辑：只显示当前页前后几页
+        const startPage = Math.max(1, currentPage - 2);
+        const endPage = Math.min(totalPages, currentPage + 2);
+
+        if (startPage > 1) html += `<a href="#" class="pagination-link" data-page="1">1</a>`;
+        if (startPage > 2) html += `<span class="pagination-link disabled">...</span>`;
+
+        for (let i = startPage; i <= endPage; i++) {
+            html += `<a href="#" class="pagination-link ${i === currentPage ? 'active' : ''}" data-page="${i}">${i}</a>`;
+        }
+
+        if (endPage < totalPages - 1) html += `<span class="pagination-link disabled">...</span>`;
+        if (endPage < totalPages) html += `<a href="#" class="pagination-link" data-page="${totalPages}">${totalPages}</a>`;
+
+        // 下一页
+        html += `<a href="#" class="pagination-link ${currentPage === totalPages ? 'disabled' : ''}" data-page="${currentPage + 1}">下一页</a>`;
+        
+        container.innerHTML = html;
+    }
+
+
+    // ... (loadSettings, saveSettings 函数与之前版本相同)
+    async function loadSettings() {
+        try {
+            const response = await fetch('/api/v1/get_config');
+            if (!response.ok) {
+                console.log('Error:', response.statusText);
+                return;
+            }
+            const config = await response.json();
+            const port = config['webui_port'];
+            const addr = config['bind_addr'];
+            const id = config['node_id'];
+
+            document.getElementById('webui-port-input').value = port;
+            document.getElementById('bind-addr-input').value = addr;
+            document.getElementById('node-id-input').value = id;
+        }
+        catch (e) {
+            console.log(e);
+        }
+    }
+    async function saveSettings() {
+        addLog("正在保存设置...");
+        const port = document.getElementById('webui-port-input').value;
+        const addr = document.getElementById('bind-addr-input').value;
+        const id = document.getElementById('node-id-input').value;
+
+        try {
+            const response = await fetch('/api/v1/set_config', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ webui_port: parseInt(port), bind_addr: addr, node_id: id })
+            });
+            const text = await response.text();
+
+            if (!response.ok) {
+                alert(`Error: ${text}`);
+                return;
+            }
+            if (!response.text === "OK") {
+                alert(`Error: ${text}`);
+                return;
+            }
+
+            addLog("设置保存成功");
+        }
+        catch (e) {
+            console.log(e);
+        }
+    }
+</script>
+
+</body>
+</html>

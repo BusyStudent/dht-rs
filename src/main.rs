@@ -1,4 +1,8 @@
-fn main() {
+mod app;
+
+#[tokio::main]
+async fn main() {
     color_backtrace::install();
-    dht_rs::hello_world();
+    let app = app::App::new();
+    app.run().await;
 }
