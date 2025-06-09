@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::{NodeId, core::RoutingTable};
+use crate::{NodeId, dht::RoutingTable};
 use crate::krpc::*;
 
 const KRPC_TIMEOUT_DRUATION: Duration = Duration::from_secs(3); // The default timeout of krpc
@@ -43,7 +43,7 @@ type NodeEndpoint = (NodeId, SocketAddr);
 
 /// Sort the nodes by distance to the target node, and remove duplicates
 /// based on the NodeId.
-fn sort_node_and_unique(nodes: &mut Vec<NodeEndpoint>, target: NodeId){
+fn sort_node_and_unique(nodes: &mut Vec<NodeEndpoint>, target: NodeId) {
     nodes.sort_by(|(a, _), (b, _)| {
         let a_dis = *a ^ target;
         let b_dis = *b ^ target;
@@ -77,6 +77,10 @@ impl DhtSession {
     }
 
     fn routing_table_mut(&self) -> MutexGuard<'_, RoutingTable> {
+        return self.inner.routing_table.lock().expect("Mutex poisoned");
+    }
+
+    pub fn routing_table(&self) -> MutexGuard<'_, RoutingTable> {
         return self.inner.routing_table.lock().expect("Mutex poisoned");
     }
 
@@ -469,7 +473,7 @@ impl DhtSession {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 continue;
             } 
-            debug!("DHT session bootstrap done, routing table {:?}", self.routing_table_mut());
+            info!("DHT session bootstrap done");
             self.refresh_routing_table().await;
         }
     }

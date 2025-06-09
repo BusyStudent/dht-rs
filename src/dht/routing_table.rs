@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use std::cmp;
 use tracing::{debug, error, info, trace};
 
-use super::NodeId;
+use crate::NodeId;
 
 pub const KBUCKET_SIZE: usize = 8;
 

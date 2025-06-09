@@ -1,4 +1,5 @@
 pub mod bencode;
+pub mod crawler;
 pub mod core;
 pub mod krpc;
 pub mod dht;

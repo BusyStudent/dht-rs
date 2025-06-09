@@ -279,7 +279,7 @@
         <!-- 元数据查找 -->
         <div id="metadata-content" class="tab-content">
             <h2>元数据查找</h2>
-            <input type="text" id="search-input" placeholder="输入 Info Hash 或 种子名称关键字，停止输入后自动搜索...">
+            <input type="text" id="search-input" placeholder="输入 Info Hash 或 种子名称关键字 *选择所有，停止输入后自动搜索...">
             <div class="scrollable-area">
                 <div id="search-results"></div>
             </div>
@@ -308,14 +308,16 @@
 <script>
     // --- 全局变量和初始化 ---
     let searchDebounceTimer; // 用于搜索防抖的计时器
+    let routingTableTimer;   // 用于更新路由表的计时器
     let currentQuery = '';   // 当前搜索的关键词
     let currentPage = 1;     // 当前搜索的页码
 
     document.addEventListener('DOMContentLoaded', () => {
         loadSettings();
-        addLog("欢迎使用 DHT Crawler 控制面板。");
+        addLog("欢迎使用 DHT Indexer 控制面板。");
         addLog("前端界面已就绪，等待与后端交互。");
         setupEventListeners();
+        queryStatus();
     });
 
     // --- Tab 切换逻辑 ---
@@ -324,7 +326,17 @@
         document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
         document.getElementById(`${tabName}-content`).classList.add('active');
         document.querySelector(`.tab-button[onclick="showTab('${tabName}')"]`).classList.add('active');
-        if (tabName === 'routing') updateRoutingTable();
+        if (routingTableTimer != null) {
+            console.log('关闭路由表计时器');
+            clearInterval(routingTableTimer);
+            routingTableTimer = null;
+        }
+
+        if (tabName === 'routing') {
+            console.log('启动路由表计时器');
+            updateRoutingTable();
+            routingTableTimer = setInterval(updateRoutingTable, 1000); // 每隔1s更新一下
+        }
     }
 
     // --- 事件监听器设置 ---
@@ -384,8 +396,25 @@
     }
 
     // --- 与后端交互的函数 ---
+    // 看看有没有已经启动了
+    async function queryStatus() {
+        try {
+            const response = await fetch('/api/v1/is_dht_running');
+            const running = await response.json();
+            if (running) {
+                document.getElementById('start-btn').style.display = 'none';
+                document.getElementById('stop-btn').style.display = 'inline-block';
+            }
+            else {
+                document.getElementById('stop-btn').style.display = 'none';
+                document.getElementById('start-btn').style.display = 'inline-block';
+            }
+        }
+        catch (e) {
 
-    // ... (startCrawler, stopCrawler, addLog, updateRoutingTable 函数与之前版本相同，此处省略以保持简洁)
+        }
+    }
+
     async function startCrawler() {
         if (document.getElementById('start-btn').style.display === 'none') {
             return; // 早就有个任务在启动了
@@ -439,12 +468,26 @@
     async function updateRoutingTable() {
         const list = document.getElementById('routing-table-list');
         const countSpan = document.getElementById('node-count');
-        list.innerHTML = '<li>正在从后端获取数据...</li>';
-        setTimeout(() => {
-            const mockNodes = ['a1b2c3d4... | 192.168.1.10:6881','e5f6g7h8... | 8.8.8.8:6881','i9j0k1l2... | 202.108.22.5:12345'];
-            list.innerHTML = mockNodes.map(node => `<li>${node}</li>`).join('');
-            countSpan.textContent = mockNodes.length;
-        }, 1000);
+        try {
+            // list.innerHTML = '<li>正在从后端获取数据...</li>';
+            // setTimeout(() => {
+            //     const mockNodes = ['a1b2c3d4... | 192.168.1.10:6881','e5f6g7h8... | 8.8.8.8:6881','i9j0k1l2... | 202.108.22.5:12345'];
+            //     list.innerHTML = mockNodes.map(node => `<li>${node}</li>`).join('');
+            //     countSpan.textContent = mockNodes.length;
+            // }, 1000);
+            const response = await fetch('/api/v1/get_routing_table');
+            if (!response.ok) {
+                list.innerHTML = '<li>无法连接到后端</li>';
+                return;
+            }
+            const json = await response.json();
+            list.innerHTML = json.map(node => `<li>${node.id} | ${node.ip}</li>`).join('');
+            countSpan.textContent = json.length;
+        }
+        catch (e) {
+            list.innerHTML = `<li>出错 ${e}</li>`;
+        }
+        
     }
     // ...
 
@@ -480,34 +523,46 @@
         // .catch(err => {
         //     resultsContainer.innerHTML = `<p>搜索失败: ${err}</p>`;
         // });
+        try {
+            const response = await fetch('/api/v1/search_metadata', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ query: currentQuery, page: currentPage })
+            });
+            const json = await response.json();
+            displaySearchResults(json.results);
+            renderPaginationControls(json.totalPages, json.currentPage);
+        }
+        catch (e) {
+            resultsContainer.innerHTML = `<p>搜索失败: ${err}</p>`;
+        }
 
-        // 模拟搜索结果
-        console.log(`正在模拟搜索: "${currentQuery}", 第 ${currentPage} 页`);
-        setTimeout(() => {
-             const mockFullData = {
-                results: [
-                    {
-                        name: 'ubuntu-22.04.3-desktop-amd64.iso',
-                        info_hash: 'f8c0e6e7d4b3a299f1e9a217c5b3f0e8a1c2b3d4',
-                        size: '4.7 GB',
-                        files: [{ name: 'ubuntu.iso', size: '4.7 GB' }, { name: 'README.txt', size: '1.2 KB' }]
-                    },
-                    { // 新增：只有 hash 的情况
-                        info_hash: 'aabbccddeeff00112233445566778899aabbccdd'
-                    },
-                    {
-                        name: '[Tears of Steel] a short film by the Blender Foundation',
-                        info_hash: 'd8c0e6e7d4b3a299f1e9a217c5b3f0e8a1c2b3d9',
-                        size: '522 MB',
-                        files: [{ name: 'Tears of Steel.mp4', size: '520 MB' }, { name: 'poster.jpg', size: '2 MB' }]
-                    }
-                ],
-                totalPages: 5,
-                currentPage: currentPage
-            };
-            displaySearchResults(mockFullData.results);
-            renderPaginationControls(mockFullData.totalPages, mockFullData.currentPage);
-        }, 800);
+        // console.log(`正在模拟搜索: "${currentQuery}", 第 ${currentPage} 页`);
+        // setTimeout(() => {
+        //      const mockFullData = {
+        //         results: [
+        //             {
+        //                 name: 'ubuntu-22.04.3-desktop-amd64.iso',
+        //                 info_hash: 'f8c0e6e7d4b3a299f1e9a217c5b3f0e8a1c2b3d4',
+        //                 size: '4.7 GB',
+        //                 files: [{ name: 'ubuntu.iso', size: '4.7 GB' }, { name: 'README.txt', size: '1.2 KB' }]
+        //             },
+        //             { // 新增：只有 hash 的情况
+        //                 info_hash: 'aabbccddeeff00112233445566778899aabbccdd'
+        //             },
+        //             {
+        //                 name: '[Tears of Steel] a short film by the Blender Foundation',
+        //                 info_hash: 'd8c0e6e7d4b3a299f1e9a217c5b3f0e8a1c2b3d9',
+        //                 size: '522 MB',
+        //                 files: [{ name: 'Tears of Steel.mp4', size: '520 MB' }, { name: 'poster.jpg', size: '2 MB' }]
+        //             }
+        //         ],
+        //         totalPages: 5,
+        //         currentPage: currentPage
+        //     };
+        //     displaySearchResults(mockFullData.results);
+        //     renderPaginationControls(mockFullData.totalPages, mockFullData.currentPage);
+        // }, 800);
     }
     
     /**
