@@ -8,8 +8,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard}
 };
 use tokio::{
-    net,
-    task::JoinHandle
+    io::AsyncReadExt, net, task::JoinHandle
 };
 use axum::{
     Router, 
@@ -21,11 +20,10 @@ use axum::{
 
 // Import our own modules
 use dht_rs::{
-    crawler::{Crawler, CrawlerConfig, CrawlerObserver}, 
-    *
+    bt::Torrent, crawler::{Crawler, CrawlerConfig, CrawlerObserver}, *
 };
 
-use tracing::info;
+use tracing::{info, error};
 
 #[derive(Deserialize, Serialize, Clone)]
 struct Config {
@@ -70,9 +68,34 @@ fn default_ip() -> String {
 const MAX_SEARCH_PER_PAGES: usize = 50;
 
 impl CrawlerObserver for AppInner {
-    fn on_info_hash_found(&self, _info_hash: InfoHash) -> bool {
-        let is_new = self.info_hashes.lock().unwrap().insert(_info_hash);
+    fn on_info_hash_found(&self, hash: InfoHash) -> bool {
+        let is_new = self.info_hashes.lock().unwrap().insert(hash);
+        if is_new { // Check exist in the filesystem?
+            if self.has_metadata(hash) {
+                return false; // Already exists
+            }
+            info!("Found a new info hash: {}", hash);
+        }
         return is_new;
+    }
+
+    fn has_metadata(&self, hash: InfoHash) -> bool {
+        return fs::exists(format!("./data/torrents/{}.torrent", hash)).unwrap_or(false);
+    }
+
+    fn on_metadata_downloaded(&self, hash: InfoHash, data: Vec<u8>) {
+        let torrent = Torrent::from_info_bytes(&data).expect("It should never failed");
+        let data = torrent.object().encode();
+        let mut file = match fs::File::create(format!("./data/torrents/{}.torrent", hash)) {
+            Ok(file) => file,
+            Err(err) => {
+                error!("Can not create the file: {}", err);
+                return;
+            }
+        };
+        if let Err(err) = file.write_all(&data) {
+            error!("Can not write the file: {}", err);
+        }
     }
 }
 
@@ -245,27 +268,75 @@ impl App {
 
     // Search
     async fn search_metadata_handler_impl(State(_app): State<App>, extract::Json(search): extract::Json<MetadataSearch>) -> Result<String, io::Error> {
+        let length_to_string = |length: u64| {
+            if length < 1024 {
+                return format!("{} bytes", length);
+            }
+            if length < 1024 * 1024 {
+                return format!("{} KB", length / 1024);
+            }
+            if length < 1024 * 1024 * 1024 {
+                return format!("{} MB", length / 1024 / 1024);
+            }
+            return format!("{} GB", length / 1024 / 1024 / 1024);
+        };
+
         let _pattern = search.query;
+        let page = search.page;
         // Enumerate all the files in in torrents folder
         let mut items = Vec::new();
-        let mut entries = tokio::fs::read_dir("./data/torrents").await?;
         let mut items_len = 0; // The number of max item
+        let mut entries = tokio::fs::read_dir("./data/torrents").await?;
+        // Broswer from filesystem
         while let Some(entry) = entries.next_entry().await? {
             items_len += 1;
-            if search.page * MAX_SEARCH_PER_PAGES < (items_len + MAX_SEARCH_PER_PAGES) { // Because the search.page start at 1
+            if page * MAX_SEARCH_PER_PAGES < items_len - 1 {
                 continue;
             }
-            if (search.page + 1) * MAX_SEARCH_PER_PAGES <= (items_len + MAX_SEARCH_PER_PAGES) {
+            if (page + 1) * MAX_SEARCH_PER_PAGES <= items_len - 1 {
                 continue; // We need the count of items to calc the max page
             }
+            let mut file = tokio::fs::File::open(entry.path()).await?;
+            let mut vec = Vec::new();
+            file.read_to_end(&mut vec).await?;
             let filename = entry.file_name().into_string().unwrap();
+
+            // Parse the torrent
+            let torrent = Torrent::from_bytes(&vec).
+                ok_or(io::Error::new(io::ErrorKind::Other, "Invalid torrent file"))?;
+            let hash_name = filename.split('.').next().unwrap_or(filename.as_str());
+            let mut files = Vec::new();
+
+            for (name, length) in torrent.files() {
+                files.push(serde_json::json!({
+                    "name": name,
+                    "size": length_to_string(length),
+                }));
+            }
             items.push(Metadata {
-                info_hash: filename,
+                info_hash: hash_name.to_string(),
+                name: Some(torrent.name().into()),
+                size: Some(length_to_string(torrent.length())),
+                files: Some(serde_json::json!(files)),
+            });
+        }
+        // Broswer from the memory
+        for hash in _app.inner.info_hashes.lock().unwrap().iter() {
+            items_len += 1;
+            if page * MAX_SEARCH_PER_PAGES < items_len - 1 {
+                continue;
+            }
+            if (page + 1) * MAX_SEARCH_PER_PAGES <= items_len -1 {
+                continue; // We need the count of items to calc the max page
+            }
+            items.push(Metadata {
+                info_hash: hash.hex(),
                 .. Default::default()
             });
         }
+
         let json = serde_json::json!({
-            "result": items,
+            "results": items,
             "totalPages": items_len / MAX_SEARCH_PER_PAGES,
             "currentPage": search.page,
         });

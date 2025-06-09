@@ -109,6 +109,15 @@ pub enum BtError {
     #[error("The message we received has too large len")]
     MessageTooLarge,
 
+    #[error("The peer doesn't support extension we want")]
+    UnsupportedExtension,
+
+    #[error("No piece index in the request")]
+    NoPieceIndex,
+
+    #[error("User defined error: {}", .0)]
+    UserDefined(String),
+
     #[error("NetworkError {:?}", .0)]
     NetworkError(#[from] io::Error),
 }

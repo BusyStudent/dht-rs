@@ -1,11 +1,7 @@
 #![allow(dead_code, unused_imports)] // Let it shutup!
 
 use crate::{
-    bt::*, 
-    dht::*, 
-    krpc::*, 
-    InfoHash, 
-    NodeId
+    bt::*, crawler::downloader::Downloader, dht::*, krpc::*, InfoHash, NodeId
 };
 use std::{
     collections::BTreeSet, 
@@ -13,15 +9,18 @@ use std::{
     net::SocketAddr, 
     sync::{Arc, Mutex, MutexGuard}
 };
-use tracing::info;
-use tokio::net::UdpSocket;
+use tracing::{info, error};
+use tokio::{
+    net::UdpSocket,
+    sync::Semaphore,
+    task::JoinSet,
+};
 
 struct CrawlerInner {
     udp: Arc<UdpSocket>,
     dht_session: DhtSession,
+    downloader: Downloader,
     observer: Arc<dyn CrawlerObserver + Send + Sync>,
-
-    // For 
 }
 
 /// The cralwer is responsible for collect info hash and download metadata
@@ -45,6 +44,11 @@ pub trait CrawlerObserver {
     fn on_metadata_downloaded(&self, _info_hash: InfoHash, _data: Vec<u8>) {
         // 
     }
+
+    /// Check did we has this metadata?
+    fn has_metadata(&self, _info_hash: InfoHash) -> bool {
+        return false;
+    }
 }
 
 impl Crawler {
@@ -57,7 +61,8 @@ impl Crawler {
             inner: Arc::new(CrawlerInner {
                 udp: udp.clone(),
                 dht_session: session.clone(),
-                observer: config.observer
+                downloader: Downloader::new(config.observer.clone()),
+                observer: config.observer,
             }),
         };
 
@@ -76,18 +81,21 @@ impl Crawler {
     async fn process_udp(&self) {
         let mut buf = [0u8; 65535];
         loop {
-            let (n, addr) = self.inner.udp.recv_from(&mut buf).await.unwrap();
+            let (n, addr) = match self.inner.udp.recv_from(&mut buf).await {
+                Ok(val) => val,
+                Err(err) => {
+                    error!("Failed to recv data from udp socket: {}", err);
+                    continue;
+                }
+            };
             self.inner.dht_session.process_udp(&buf[..n], &addr).await;
         }
     }
 
-    fn on_peer_announce(inner: Arc<CrawlerInner>, info_hash: InfoHash, _addr: SocketAddr) {
-        let new = {
-            // info!("Found info hash: {}", info_hash);
-            inner.observer.on_info_hash_found(info_hash)
-        };
-        if !new { // Already in the list
-            return;
+    fn on_peer_announce(inner: Arc<CrawlerInner>, info_hash: InfoHash, ip: SocketAddr) {
+        inner.observer.on_info_hash_found(info_hash);
+        if !inner.observer.has_metadata(info_hash) {
+            inner.downloader.add_peer(info_hash, ip);
         }
     }
 

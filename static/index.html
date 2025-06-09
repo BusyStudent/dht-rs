@@ -534,7 +534,7 @@
             renderPaginationControls(json.totalPages, json.currentPage);
         }
         catch (e) {
-            resultsContainer.innerHTML = `<p>搜索失败: ${err}</p>`;
+            resultsContainer.innerHTML = `<p>搜索失败: ${e}</p>`;
         }
 
         // console.log(`正在模拟搜索: "${currentQuery}", 第 ${currentPage} 页`);

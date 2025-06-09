@@ -312,7 +312,7 @@ impl DhtSession {
                     Some(val) => val,
                     None => return false,
                 };
-                info!("Collecting infohash {} from {}", query.info_hash, ip);
+                // info!("Collecting infohash {} from {}", query.info_hash, ip);
                 if query.token != ip.to_string().into_bytes() {
                     // Invalid token, ignore it
                     error!("Invalid token: {:?}", query.token);
