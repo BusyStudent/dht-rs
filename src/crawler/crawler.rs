@@ -1,7 +1,7 @@
 #![allow(dead_code, unused_imports)] // Let it shutup!
 
 use crate::{
-    bt::*, crawler::downloader::Downloader, dht::*, krpc::*, InfoHash, NodeId
+    bt::*, crawler::downloader::Downloader, dht::*, krpc::*, utp::UtpContext, InfoHash, NodeId
 };
 use std::{
     collections::BTreeSet, 
@@ -19,6 +19,7 @@ use tokio::{
 struct CrawlerInner {
     udp: Arc<UdpSocket>,
     dht_session: DhtSession,
+    utp_context: UtpContext,
     downloader: Downloader,
     observer: Arc<dyn CrawlerObserver + Send + Sync>,
 }
@@ -55,13 +56,15 @@ impl Crawler {
     pub async fn new(config: CrawlerConfig) -> Result<Crawler, io::Error> {
         let udp = Arc::new(UdpSocket::bind(config.ip).await?);
         let krpc = KrpcContext::new(udp.clone());
+        let utp = UtpContext::new(udp.clone());
         let mut session = DhtSession::new(config.id, krpc);
 
         let this = Crawler {
             inner: Arc::new(CrawlerInner {
-                udp: udp.clone(),
+                udp: udp,
                 dht_session: session.clone(),
-                downloader: Downloader::new(config.observer.clone()),
+                utp_context: utp.clone(),
+                downloader: Downloader::new(utp, config.observer.clone()),
                 observer: config.observer,
             }),
         };
@@ -88,7 +91,18 @@ impl Crawler {
                     continue;
                 }
             };
-            self.inner.dht_session.process_udp(&buf[..n], &addr).await;
+            if n == 0 {
+                continue;
+            }
+            if buf[0] == b'd' { // Dict, almost krpc
+                if self.inner.dht_session.process_udp(&buf[..n], &addr).await { // Successfully process it
+                    continue;
+                }
+                // Try utp?
+            }
+            if self.inner.utp_context.process_udp(&buf[..n], &addr) {
+                continue;
+            }
         }
     }
 
@@ -106,6 +120,10 @@ impl Crawler {
 
     /// Start the crawler
     pub async fn run(self) {
-        tokio::join!(self.process_udp(), self.inner.dht_session.run());
+        tokio::join!(
+            self.process_udp(), // The network loop
+            self.inner.dht_session.run(), // The dht loop
+            self.inner.downloader.run()   // The download loop
+        );
     }
 }

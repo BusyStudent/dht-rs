@@ -201,15 +201,65 @@
             padding: 8px;
             font-size: 14px;
         }
-        .torrent-card .file-list {
-            display: none;
-            margin-top: 10px;
-            padding-left: 20px;
-            max-height: 150px;
+        
+        /* --- 文件树状列表样式 --- */
+        .file-list {
+            display: none; /* 默认隐藏 */
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px dashed #ccc;
+            max-height: 250px;
             overflow-y: auto;
             font-size: 14px;
-            border-top: 1px dashed #ccc;
-            padding-top: 10px;
+        }
+        /* [BUG修复] 新增 .is-shown 类用于显示 */
+        .file-list.is-shown {
+            display: block;
+        }
+        .file-list ul, .file-list li {
+            list-style-type: none;
+            padding-left: 0;
+        }
+        .file-list ul {
+            padding-left: 20px;
+        }
+        .file-list li {
+             padding: 3px 0;
+        }
+        .tree-item {
+            cursor: default;
+        }
+        .tree-item::before {
+            margin-right: 8px;
+            display: inline-block;
+            width: 1.2em;
+            font-family: 'Courier New', Courier, monospace;
+        }
+        .tree-folder {
+            font-weight: 500;
+            cursor: pointer;
+            color: #2980b9;
+        }
+        .tree-folder::before {
+            content: '▸'; /* 折叠状态 */
+        }
+        .tree-file::before {
+            content: '📄';
+        }
+        .file-size {
+            color: #7f8c8d;
+            font-size: 0.9em;
+            margin-left: 8px;
+        }
+        /* 展开/折叠 逻辑 */
+        .tree-folder-container > ul {
+            display: none; /* 子列表默认隐藏 */
+        }
+        .tree-folder-container.expanded > .tree-folder::before {
+            content: '▾'; /* 展开状态 */
+        }
+        .tree-folder-container.expanded > ul {
+            display: block; /* 显示展开的子列表 */
         }
 
         /* 翻页控件 */
@@ -364,24 +414,38 @@
         // 保存设置
         document.getElementById('save-settings-btn').addEventListener('click', saveSettings);
 
-        // 搜索结果区域的事件委托
+        // 搜索结果区域的事件委托 (处理按钮点击和文件树展开/折叠)
         document.getElementById('search-results').addEventListener('click', (e) => {
-            const target = e.target.closest('button[data-action]');
-            if (!target) return;
-            const action = target.dataset.action;
-            const hash = target.dataset.hash;
-            if (action === 'copy-hash') {
-                navigator.clipboard.writeText(hash).then(() => alert(`Info Hash 已复制: ${hash}`));
+            const target = e.target;
+
+            // 1. 处理功能按钮点击
+            const button = target.closest('button[data-action]');
+            if (button) {
+                const action = button.dataset.action;
+                const hash = button.dataset.hash;
+                
+                if (action === 'copy-hash') {
+                    navigator.clipboard.writeText(hash).then(() => alert(`Info Hash 已复制: ${hash}`));
+                } else if (action === 'copy-magnet') {
+                    const magnet = `magnet:?xt=urn:btih:${hash}`;
+                    navigator.clipboard.writeText(magnet).then(() => alert(`磁力链接已复制: ${magnet}`));
+                } else if (action === 'toggle-files') {
+                    const fileList = button.closest('.torrent-card').querySelector('.file-list');
+                    if (fileList) {
+                       // [BUG修复] 改为切换CSS类，而不是直接操作style
+                       fileList.classList.toggle('is-shown');
+                    }
+                }
+                return; // 按钮事件已处理，终止
             }
-            if (action === 'copy-magnet') {
-                const magnet = `magnet:?xt=urn:btih:${hash}`;
-                navigator.clipboard.writeText(magnet).then(() => alert(`磁力链接已复制: ${magnet}`));
-            }
-            if (action === 'toggle-files') {
-                const fileList = target.closest('.torrent-card').querySelector('.file-list');
-                fileList.style.display = fileList.style.display === 'none' ? 'block' : 'none';
+
+            // 2. 处理文件树文件夹点击
+            const folderToggle = target.closest('.tree-folder');
+            if (folderToggle) {
+                folderToggle.parentElement.classList.toggle('expanded');
             }
         });
+
 
         // 翻页控件的事件委托
         document.getElementById('pagination-controls').addEventListener('click', (e) => {
@@ -411,7 +475,7 @@
             }
         }
         catch (e) {
-
+            // ignore
         }
     }
 
@@ -489,8 +553,7 @@
         }
         
     }
-    // ...
-
+    
     /**
      * 元数据查找: 执行搜索 (支持翻页)
      * @param {number} page - 要请求的页码
@@ -508,27 +571,15 @@
         resultsContainer.innerHTML = '<p>正在搜索, 请稍候...</p>';
         renderPaginationControls(0, 0); // 清空旧的翻页
 
-        // TODO: 向后端发送带分页的搜索请求, POST /search
-        // 你的后端API需要支持接收页码参数, 并返回总页数
-        // fetch('/search', {
-        //     method: 'POST',
-        //     headers: { 'Content-Type': 'application/json' },
-        //     body: JSON.stringify({ query: currentQuery, page: currentPage })
-        // })
-        // .then(response => response.json())
-        // .then(data => { // 假设后端返回 { results: [...], totalPages: 10, currentPage: 1 }
-        //     displaySearchResults(data.results);
-        //     renderPaginationControls(data.totalPages, data.currentPage);
-        // })
-        // .catch(err => {
-        //     resultsContainer.innerHTML = `<p>搜索失败: ${err}</p>`;
-        // });
         try {
             const response = await fetch('/api/v1/search_metadata', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ query: currentQuery, page: currentPage })
             });
+            if (!response.ok) {
+                 throw new Error(`HTTP error! status: ${response.status}`);
+            }
             const json = await response.json();
             displaySearchResults(json.results);
             renderPaginationControls(json.totalPages, json.currentPage);
@@ -566,7 +617,70 @@
     }
     
     /**
-     * 元数据查找: 显示搜索结果 (适配纯hash)
+     * 将扁平的文件列表（包含路径）转换为嵌套的树对象。
+     * @param {Array<Object>} files - 例如 [{ name: 'dir/file.txt', size: '1KB' }]
+     * @returns {Object} 树状结构
+     */
+    function buildFileTree(files) {
+        const tree = {};
+        files.forEach(file => {
+            const pathParts = file.name.split('/');
+            let currentLevel = tree;
+
+            pathParts.forEach((part, index) => {
+                if (index === pathParts.length - 1) { // 路径的最后一部分是文件
+                    currentLevel[part] = { type: 'file', size: file.size };
+                } 
+                else { // 路径的中间部分是文件夹
+                    if (!currentLevel[part]) {
+                        currentLevel[part] = { type: 'folder', children: {} };
+                    }
+                    currentLevel = currentLevel[part].children;
+                }
+            });
+        });
+        return tree;
+    }
+
+    /**
+     * 将文件树对象递归地渲染成HTML字符串。
+     * @param {Object} treeNode - 文件树的一个节点
+     * @returns {string} HTML字符串
+     */
+    function renderTreeToHTML(treeNode) {
+        // 排序，使文件夹总是在文件前面
+        const sortedKeys = Object.keys(treeNode).sort((a, b) => {
+            const itemA = treeNode[a];
+            const itemB = treeNode[b];
+            const aIsFolder = itemA.type === 'folder';
+            const bIsFolder = itemB.type === 'folder';
+
+            if (aIsFolder && !bIsFolder) return -1;
+            if (!aIsFolder && bIsFolder) return 1;
+            return a.localeCompare(b); // 同类型则按字母排序
+        });
+
+        let html = '<ul>';
+        for (const key of sortedKeys) {
+            const item = treeNode[key];
+            if (item.type === 'folder') {
+                html += `<li class="tree-folder-container">
+                            <span class="tree-item tree-folder">${key}</span>
+                            ${renderTreeToHTML(item.children)}
+                         </li>`;
+            } else {
+                html += `<li>
+                            <span class="tree-item tree-file">${key}</span>
+                            <span class="file-size">(${item.size})</span>
+                         </li>`;
+            }
+        }
+        html += '</ul>';
+        return html;
+    }
+
+    /**
+     * 元数据查找: 显示搜索结果 (适配纯hash和树状文件列表)
      * @param {Array} results - 搜索结果数组
      */
     function displaySearchResults(results) {
@@ -581,7 +695,9 @@
         results.forEach(item => {
             let cardHTML;
             if (item.name) { // 有完整元数据
-                const fileListHTML = item.files.map(file => `<li>${file.name} (${file.size})</li>`).join('');
+                const fileTree = buildFileTree(item.files);
+                const fileListHTML = renderTreeToHTML(fileTree);
+                // [BUG修复] 移除 file-list 上的内联 style 属性
                 cardHTML = `
                     <div class="torrent-card">
                         <h4>${item.name}</h4>
@@ -591,7 +707,7 @@
                             <button class="button" data-action="copy-magnet" data-hash="${item.info_hash}">复制磁力</button>
                             <button class="button" data-action="toggle-files">查看文件</button>
                         </div>
-                        <ul class="file-list" style="display: none;">${fileListHTML}</ul>
+                        <div class="file-list">${fileListHTML}</div>
                     </div>
                 `;
             } else { // 只有 info_hash

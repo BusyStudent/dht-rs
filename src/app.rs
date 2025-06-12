@@ -117,7 +117,7 @@ impl App {
                     webui_port: 10721, // Ciallo～(∠・ω< )
                     webui_ip: "127.0.0.1".to_string(),
                     bind_addr: "0.0.0.0:0".parse().unwrap(),
-                    node_id: String::new(),
+                    node_id: NodeId::rand().hex(),
                 }
             },
         };

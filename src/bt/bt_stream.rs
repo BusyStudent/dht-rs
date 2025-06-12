@@ -504,17 +504,36 @@ impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
 
 #[cfg(test)]
 mod tests {
-    use crate::bt::UtMetadataMessage;
+    use crate::{bt::UtMetadataMessage, utp::{UtpContext, UtpSocket} };
 
     use super::*;
     use tracing::error;
     use tokio::{net};
+    use std::sync::Arc;
 
     #[tokio::test]
     #[ignore]
     async fn test_bt_stream() -> Result<(), BtError> {
         // Test on my bittorrent
-        let stream = net::TcpStream::connect("127.0.0.1:35913").await?;
+        // let stream = net::TcpStream::connect("127.0.0.1:35913").await?;
+        let udp = Arc::new(net::UdpSocket::bind("127.0.0.1:0").await?);
+        let utp_context = UtpContext::new(udp.clone());
+        let utp_context2 = utp_context.clone();
+        let worker = tokio::spawn(async move {
+            let mut buf = [0u8; 65535];
+            loop {
+                match udp.recv_from(&mut buf).await {
+                    Ok((len, addr)) => {
+                        let _ = utp_context2.process_udp(&buf[..len], &addr);
+                    },
+                    Err(err) => {
+                        error!("Error: {err}");
+                    }
+                }
+            }
+        });
+        let stream = UtpSocket::connect(&utp_context, "127.0.0.1:35913".parse().unwrap()).await?;
+
         let info = BtHandshakeInfo {
             hash: InfoHash::from_hex("4ce5c1ec28454f6f0e5c009e74df3a62a9efafa8").unwrap(),
             peer_id: PeerId::make(),
@@ -574,6 +593,8 @@ mod tests {
             None => return Ok(()),
         };
         debug!("Got torrent {:?}", obj);
+        worker.abort();
+        let _ = worker.await;
         return Ok(());
     }
 }

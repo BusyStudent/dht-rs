@@ -3,12 +3,12 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use libc::{sockaddr, c_int};
 // FUCK WINDOWS
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, SOCKADDR_IN as sockaddr_in, SOCKADDR_IN6 as sockaddr_in6,
+pub use windows_sys::Win32::Networking::WinSock::{
+    AF_INET, AF_INET6, SOCKADDR_IN as sockaddr_in, SOCKADDR_IN6 as sockaddr_in6, SOCKADDR_STORAGE as sockaddr_storage,
 };
 
 #[cfg(target_os = "linux")]
-use libc::{AF_INET, AF_INET6, sockaddr_in, sockaddr_in6};
+pub use libc::{AF_INET, AF_INET6, sockaddr_in, sockaddr_in6, sockaddr_storage};
 
 
 #[derive(Clone, Copy)]
