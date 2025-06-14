@@ -294,6 +294,49 @@
             cursor: not-allowed;
             background-color: #f5f5f5;
         }
+
+        /* --- [新增] 手动工具样式 --- */
+        .tool-section {
+            background-color: #ffffff;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border: 1px solid #e0e0e0;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+        }
+        .tool-section h3 {
+            margin-top: 0;
+            color: #3498db;
+            border-bottom: 1px solid #ecf0f1;
+            padding-bottom: 10px;
+            font-size: 18px;
+        }
+        .input-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        .input-group input {
+            flex-grow: 1;
+            margin-bottom: 0; /* Override form-group's margin on input */
+        }
+        .input-group .button {
+            flex-shrink: 0; /* Prevent random button from shrinking */
+            padding: 10px; /* Make it same height as input */
+        }
+        .tool-response {
+            background-color: #2c3e50; /* Darker background */
+            color: #ecf0f1; /* Lighter text */
+            border: 1px solid #34495e;
+            border-radius: 4px;
+            padding: 15px;
+            margin-top: 15px;
+            min-height: 60px;
+            white-space: pre-wrap;
+            word-break: break-all;
+            font-family: "Courier New", Courier, monospace;
+            font-size: 14px;
+        }
     </style>
 </head>
 <body>
@@ -304,6 +347,8 @@
         <button class="tab-button" onclick="showTab('routing')">路由表</button>
         <button class="tab-button" onclick="showTab('metadata')">元数据查找</button>
         <button class="tab-button" onclick="showTab('settings')">设置</button>
+        <!-- [新增] 工具 Tab -->
+        <button class="tab-button" onclick="showTab('tools')">工具</button>
     </div>
 
     <!-- 右侧内容区 -->
@@ -353,6 +398,78 @@
             </div>
             <button id="save-settings-btn" class="button">保存设置</button>
         </div>
+        
+        <!-- [新增] 工具界面 -->
+        <div id="tools-content" class="tab-content">
+            <h2>手动工具</h2>
+            <p>用于手动向 DHT 网络中的特定节点发送请求，以进行调试。</p>
+            
+            <div class="tool-section">
+                <h3>Ping 节点</h3>
+                <div class="form-group">
+                    <label for="tools-ping-addr-input">节点地址 (IP:Port)</label>
+                    <input type="text" id="tools-ping-addr-input" placeholder="例如: 123.45.67.89:6881">
+                </div>
+                <button class="button tool-btn" data-tool="ping">发送 Ping</button>
+                <pre id="tools-ping-response" class="tool-response">响应将显示在此处</pre>
+            </div>
+        
+            <div class="tool-section">
+                <h3>Get Peers</h3>
+                <div class="form-group">
+                    <label for="tools-getpeers-addr-input">节点地址 (IP:Port)</label>
+                    <input type="text" id="tools-getpeers-addr-input" placeholder="目标节点地址">
+                </div>
+                <div class="form-group">
+                    <label for="tools-getpeers-hash-input">Info Hash (40个十六进制字符)</label>
+                    <div class="input-group">
+                        <input type="text" id="tools-getpeers-hash-input">
+                        <button class="button random-btn" data-random-for="tools-getpeers-hash-input">随机</button>
+                    </div>
+                </div>
+                <button class="button tool-btn" data-tool="get_peers">发送 Get Peers</button>
+                <pre id="tools-get-peers-response" class="tool-response">响应将显示在此处</pre>
+            </div>
+        
+            <div class="tool-section">
+                <h3>Announce Peer</h3>
+                <div class="form-group">
+                    <label for="tools-announce-addr-input">节点地址 (IP:Port)</label>
+                    <input type="text" id="tools-announce-addr-input" placeholder="目标节点地址">
+                </div>
+                <div class="form-group">
+                    <label for="tools-announce-hash-input">Info Hash (40个十六进制字符)</label>
+                    <div class="input-group">
+                        <input type="text" id="tools-announce-hash-input">
+                        <button class="button random-btn" data-random-for="tools-announce-hash-input">随机</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="tools-announce-port-input">我方 Peer 端口</label>
+                    <input type="number" id="tools-announce-port-input" placeholder="例如: 6881">
+                </div>
+                <button class="button tool-btn" data-tool="announce_peer">发送 Announce Peer</button>
+                <pre id="tools-announce-peer-response" class="tool-response">响应将显示在此处</pre>
+            </div>
+        
+            <div class="tool-section">
+                <h3>Sample Infohashes</h3>
+                <div class="form-group">
+                    <label for="tools-sample-addr-input">节点地址 (IP:Port)</label>
+                    <input type="text" id="tools-sample-addr-input" placeholder="目标节点地址">
+                </div>
+                <div class="form-group">
+                    <label for="tools-sample-target-input">目标 Node ID (40个十六进制字符)</label>
+                    <div class="input-group">
+                        <input type="text" id="tools-sample-target-input">
+                        <button class="button random-btn" data-random-for="tools-sample-target-input">随机</button>
+                    </div>
+                </div>
+                <button class="button tool-btn" data-tool="sample_infohashes">发送 Sample Infohashes</button>
+                <pre id="tools-sample-infohashes-response" class="tool-response">响应将显示在此处</pre>
+            </div>
+        </div>
+
     </div>
 
 <script>
@@ -385,7 +502,7 @@
         if (tabName === 'routing') {
             console.log('启动路由表计时器');
             updateRoutingTable();
-            routingTableTimer = setInterval(updateRoutingTable, 1000); // 每隔1s更新一下
+            routingTableTimer = setInterval(updateRoutingTable, 5000); // 每隔5s更新一下
         }
     }
 
@@ -456,6 +573,29 @@
             }
             const page = parseInt(target.dataset.page, 10);
             searchMetadata(page);
+        });
+
+        // [新增] 手动工具区域的事件委托
+        document.getElementById('tools-content').addEventListener('click', (e) => {
+            const target = e.target;
+    
+            // 处理 "随机" 按钮
+            if (target.classList.contains('random-btn')) {
+                const targetInputId = target.dataset.randomFor;
+                if (targetInputId) {
+                    const inputElement = document.getElementById(targetInputId);
+                    if (inputElement) {
+                        // Node ID 和 Info Hash 都是 20 字节
+                        inputElement.value = generateRandomHex(20);
+                    }
+                }
+            }
+    
+            // 处理 "发送" 按钮
+            if (target.classList.contains('tool-btn')) {
+                const toolName = target.dataset.tool;
+                handleToolRequest(toolName);
+            }
         });
     }
 
@@ -761,6 +901,82 @@
         html += `<a href="#" class="pagination-link ${currentPage === totalPages ? 'disabled' : ''}" data-page="${currentPage + 1}">下一页</a>`;
         
         container.innerHTML = html;
+    }
+
+    // --- [新增] 工具相关函数 ---
+
+    /**
+     * 生成指定长度的随机十六进制字符串.
+     * @param {number} numBytes - 字节数 (例如, 20 for InfoHash/NodeID).
+     * @returns {string} 2 * numBytes 长度的十六进制字符串.
+     */
+    function generateRandomHex(numBytes) {
+        const buffer = new Uint8Array(numBytes);
+        window.crypto.getRandomValues(buffer);
+        return Array.from(buffer, byte => byte.toString(16).padStart(2, '0')).join('');
+    }
+
+    /**
+     * 处理手动工具的请求.
+     * @param {string} toolName - 工具名称, e.g., 'ping', 'get_peers'.
+     */
+    async function handleToolRequest(toolName) {
+        // 将 get_peers 转换为 getpeers 以匹配元素ID
+        const responseEl = document.getElementById(`tools-${toolName.replace('_', '-')}-response`);
+        if (!responseEl) return;
+
+        responseEl.textContent = '正在发送请求...';
+
+        const endpoint = `/api/v1/tools/${toolName}`;
+        let payload = {};
+
+        try {
+            // 根据工具名称构建 payload
+            switch (toolName) {
+                case 'ping':
+                    payload.address = document.getElementById('tools-ping-addr-input').value;
+                    if (!payload.address) throw new Error('节点地址不能为空');
+                    break;
+                case 'get_peers':
+                    payload.address = document.getElementById('tools-getpeers-addr-input').value;
+                    payload.info_hash = document.getElementById('tools-getpeers-hash-input').value;
+                    if (!payload.address || !payload.info_hash) throw new Error('地址和 Info Hash 不能为空');
+                    break;
+                case 'announce_peer':
+                    payload.address = document.getElementById('tools-announce-addr-input').value;
+                    payload.info_hash = document.getElementById('tools-announce-hash-input').value;
+                    const port = document.getElementById('tools-announce-port-input').value;
+                    if (!payload.address || !payload.info_hash || !port) throw new Error('地址、Info Hash 和端口不能为空');
+                    payload.port = parseInt(port, 10);
+                    break;
+                case 'sample_infohashes':
+                    payload.address = document.getElementById('tools-sample-addr-input').value;
+                    payload.target = document.getElementById('tools-sample-target-input').value;
+                    if (!payload.address || !payload.target) throw new Error('地址和目标 Node ID 不能为空');
+                    break;
+                default:
+                    throw new Error(`未知的工具: ${toolName}`);
+            }
+
+            const response = await fetch(endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const responseData = await response.json();
+
+            if (!response.ok) {
+                // 如果后端返回了带 error 字段的 JSON，就显示它，否则显示通用HTTP错误
+                throw new Error(responseData.error || `HTTP 错误: ${response.status}`);
+            }
+
+            // 成功，格式化并显示 JSON
+            responseEl.textContent = JSON.stringify(responseData, null, 2);
+
+        } catch (err) {
+            responseEl.textContent = `错误: ${err.message}`;
+        }
     }
 
 

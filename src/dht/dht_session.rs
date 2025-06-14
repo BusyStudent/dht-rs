@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, trace, warn};
+use thiserror::Error;
 
 use crate::{NodeId, dht::RoutingTable};
 use crate::krpc::*;
@@ -35,7 +36,10 @@ pub struct DhtSession {
     inner: Arc<DhtSessionInner>
 }
 
+/// The Error from the find_node
+#[derive(Error, Debug)]
 pub enum FindNodeError {
+    #[error("No node found")]
     AllFailed, // We try to do rpc to the nodes, but all failed, no-one give us reply
 }
 
@@ -238,6 +242,25 @@ impl DhtSession {
         return self.find_node_impl(queue, target).await;
     }
 
+    /// Ping the nodes for the given ips
+    pub async fn ping(self, ip: SocketAddr) -> Result<NodeId, KrpcError> {
+        let msg = PingQuery {
+            id: self.inner.id
+        };
+        let (reply, _) = self.do_krpc(msg, NodeId::zero(), ip).await;
+        return Ok(reply?.id);
+    }
+
+    /// Sample the infohashes from the given node
+    pub async fn sample_infohashes(self, ip: SocketAddr, target: NodeId) -> Result<SampleInfoHashesReply, KrpcError> {
+        let msg = SampleInfoHashesQuery {
+            id: self.inner.id,
+            target: target
+        };
+        let reply = self.inner.krpc.send_krpc_with_timeout(&msg, &ip, self.inner.timeout).await?;
+        return Ok(reply);
+    }
+    
     // Process the incoming udp packet
     pub async fn process_udp(&self, bytes: &[u8], ip: &SocketAddr) -> bool {
         let query = match self.inner.krpc.process_udp(bytes, ip) {

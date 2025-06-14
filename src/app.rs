@@ -14,13 +14,21 @@ use axum::{
     Router, 
     routing::{get, post}, 
     response::{Html, IntoResponse, Json},
-    extract::State,
+    extract::{State, Path},
     extract,
+};
+
+use serde_json::{
+    Value,
+    json
 };
 
 // Import our own modules
 use dht_rs::{
-    bt::Torrent, crawler::{Crawler, CrawlerConfig, CrawlerObserver}, *
+    bt::Torrent, 
+    crawler::{Crawler, CrawlerConfig, CrawlerObserver}, 
+    dht::DhtSession, 
+    *
 };
 
 use tracing::{info, error};
@@ -47,7 +55,7 @@ struct Metadata {
     info_hash: String, // The info hash of the torrent
     name: Option<String>,
     size: Option<String>, // 1 MB or 1.5 GB String
-    files: Option<serde_json::Value>, // The files in the torrent [{ name: 'ubuntu.iso', size: '4.7 GB' }, { name: 'README.txt', size: '1.2 KB' }]
+    files: Option<Value>, // The files in the torrent [{ name: 'ubuntu.iso', size: '4.7 GB' }, { name: 'README.txt', size: '1.2 KB' }]
 }
 
 struct AppInner {
@@ -147,6 +155,9 @@ impl App {
             // Info Query
             .route("/api/v1/get_routing_table", get(App::get_routing_table_handler))
 
+            // Debug Tools
+            .route("/api/v1/tools/{*tool}", post(App::tools_handler))
+
             // Search
             .route("/api/v1/search_metadata", post(App::search_metadata_handler))
 
@@ -241,12 +252,12 @@ impl App {
         }
         let mut list = Vec::new();
         for (node_id, ip) in nodes {
-            list.push(serde_json::json!({
+            list.push(json!({
                 "id": node_id.hex(),
                 "ip": ip,
             }));
         }
-        return serde_json::json!(list).to_string();
+        return json!(list).to_string();
     }
 
     // Config
@@ -308,7 +319,7 @@ impl App {
             let mut files = Vec::new();
 
             for (name, length) in torrent.files() {
-                files.push(serde_json::json!({
+                files.push(json!({
                     "name": name,
                     "size": length_to_string(length),
                 }));
@@ -317,7 +328,7 @@ impl App {
                 info_hash: hash_name.to_string(),
                 name: Some(torrent.name().into()),
                 size: Some(length_to_string(torrent.length())),
-                files: Some(serde_json::json!(files)),
+                files: Some(json!(files)),
             });
         }
         // Broswer from the memory
@@ -335,12 +346,75 @@ impl App {
             });
         }
 
-        let json = serde_json::json!({
+        let json = json!({
             "results": items,
             "totalPages": items_len / MAX_SEARCH_PER_PAGES,
             "currentPage": search.page,
         });
         return Ok(json.to_string());
+    }
+
+    // Tools
+    async fn tools_handler_impl(session: DhtSession, path: String, json: Value) -> Result<Value, String> {
+        // Get the address..
+        let addr = json["address"].as_str().ok_or("Missing address in json")?;
+        let addr = addr.parse::<SocketAddr>().map_err(|err| err.to_string() )?;
+        match path.as_str() {
+            "ping" => {
+                let res = session.ping(addr).await;
+                let id = res.map_err(|e| e.to_string() )?;
+                return Ok(json!({
+                    "id": id.hex()
+                }));
+            }
+            "sample_infohashes" => {
+                let target = json["target"].as_str().ok_or("Missing target in json")?;
+                let target = NodeId::from_hex(target).ok_or("Invalid target")?;
+                let reply = session.sample_infohashes(addr, target).await.map_err(|e| {
+                    return e.to_string()
+                })?;
+                // Convert it
+                let nodes: Vec<Value> = reply.nodes.iter().map(|(id, ip)| {
+                    return json!({
+                        "id": id.hex(),
+                        "ip": ip.to_string(),
+                    })
+                }).collect();
+                let info_hashes: Vec<Value> = reply.info_hashes.iter().map(|hash| {
+                    return json!(hash.hex());
+                }).collect();
+                return Ok(json!({
+                    "id": reply.id.hex(),
+                    "num": reply.num,
+                    "interval": reply.interval,
+                    "nodes": nodes,
+                    "info_hashes": info_hashes,
+                }));
+            }
+            _ => {
+                return Err("Invalid tool".into());
+            }
+        }
+    }
+
+    async fn tools_handler(State(app): State<App>, Path(tool): Path<String>, extract::Json(json): extract::Json<Value>) -> impl IntoResponse {
+        info!("Calling tools {tool} handler with args {json}");
+        let session = {
+            let mtx = app.inner.crawler.lock().unwrap();
+            match &*mtx {
+                Some((cralwer, _)) => cralwer.dht_session().clone(),
+                None => return Json(json!({
+                    "error": "No crawler is running"
+                })),
+            }
+        };
+        match App::tools_handler_impl(session.clone(), tool, json).await {
+            Ok(val) => return Json(val),
+            Err(err) => return Json(json!({
+                "error" : err 
+            })),
+        }
+
     }
 
     async fn search_metadata_handler(app: State<App>, json: extract::Json<MetadataSearch>) -> impl IntoResponse {

@@ -75,7 +75,7 @@ impl Downloader {
         for _ in 0..MAX_WORKERS {
             set.spawn(self.clone().worker_main());
         }
-        let _ = set.join_all().await;
+        let _ = tokio::join!(set.join_all(), self.listener_main());
     }
 
     // Pulling the job from the queue
@@ -97,6 +97,22 @@ impl Downloader {
                 let mut locked = self.inner.state.lock().unwrap();
                 locked.workers.remove(&hash); // We finished all the work
             }
+        }
+    }
+
+    async fn listener_main(&self) {
+        let mut listener = UtpListener::new(&self.inner.utp_context, 10); // MAX 10 pending.
+        loop {
+            let (stream, peer) = match listener.accept().await {
+                Ok(val) => val,
+                Err(e) => {
+                    error!("Failed to use UtpListener::accept() => {e}");
+                    return;
+                }
+            };
+            info!("Utp: Incoming peer from {}", peer);
+
+            tokio::spawn(self.clone().handle_incoming(stream));
         }
     }
 
@@ -146,9 +162,9 @@ impl Downloader {
             };
             info!("Downloaded metadata hash {} from {}", hash, peer);
 
-            self.done_job(hash);
 
             // Save it
+            self.done_job(hash);
             self.inner.observer.on_metadata_downloaded(hash, torrent);
             return;
         }
@@ -238,6 +254,38 @@ impl Downloader {
         let tcp = TcpStream::connect(ip).await?;
         let stream = BtStream::client_handshake(tcp, info).await?;
         return Downloader::do_download(stream, hash).await;
+    }
+
+    async fn handle_incoming(self, stream: UtpSocket) -> Result<(), BtError>{
+        let stream = BtStream::server_handshake(stream, |req| {
+            info!("Handshake request: for hash {}", req.hash);
+            let state = self.inner.state.lock().unwrap();
+            if !state.map.contains_key(&req.hash) {
+                return Err(BtError::HandshakeFailed);
+            }
+            let mut info = BtHandshakeInfo {
+                hash: req.hash,
+                peer_id: PeerId::make(),
+                extensions: None,
+            };
+            info.set_metadata_id(1); // We want to download the metadata use this
+            return Ok(info);
+        }).await?;
+        let hash = stream.peer_info().hash;
+        let res = tokio::time::timeout(
+        MAX_DOWNLOAD_TIME, 
+        Downloader::do_download(stream, hash)
+        ).await;
+        let torrent = match res {
+            Ok(val) => val,
+            Err(_) => return Ok(()),
+        }?;
+
+        // Save it
+        self.done_job(hash);
+        self.inner.observer.on_metadata_downloaded(hash, torrent);
+        return Ok(());
+
     }
 
     pub fn add_peer(&self, hash: InfoHash, ip: SocketAddr) {

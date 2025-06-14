@@ -81,12 +81,20 @@ pub struct PeerId {
     data: [u8; 20]
 }
 
-/// The information to handshake
+/// The information of the full handshake
 #[derive(Clone, Debug)]
 pub struct BtHandshakeInfo {
     pub hash      : InfoHash,
     pub peer_id   : PeerId,
     pub extensions: Option<Object>, // The dict, {"m": {xxx}, "v":"xxx"}
+}
+
+/// The information of the handshake request (normal bt handshake)
+#[derive(Clone, Debug)]
+pub struct BtHandshakeRequest {
+    pub hash      : InfoHash,
+    pub peer_id   : PeerId,
+    pub extensions: bool,
 }
 
 #[derive(Debug)]
@@ -153,7 +161,7 @@ mod utils {
     }
 
     /// Helper function to read the common handshake
-    pub async fn read_handshake<T: AsyncRead + Unpin>(stream: &mut T) -> Result<(InfoHash, PeerId, bool), BtError> {
+    pub async fn read_handshake<T: AsyncRead + Unpin>(stream: &mut T) -> Result<BtHandshakeRequest, BtError> {
         // LEN(1) + "BitTorrent protocol"(19) + reserved bytes(8) + infohash(20) + peerid(20)
         trace!("Read handshake...");
         let mut buffer = [0u8; 68];
@@ -178,7 +186,12 @@ mod utils {
 
         // All done
         trace!("Read hanshake(hash: {}, peer_id: {:?}, has_ext: {}", InfoHash::from(hash), PeerId::from(peer_id), has_ext);
-        return Ok((InfoHash::from(hash), PeerId::from(peer_id), has_ext));
+        let request = BtHandshakeRequest {
+            hash: InfoHash::from(hash),
+            peer_id: PeerId::from(peer_id),
+            extensions: has_ext,
+        };
+        return Ok(request);
     }
 
     // Message...
@@ -441,18 +454,17 @@ impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
         return &self.local_info;
     }
 
-    /// Handshake like an client
-    pub async fn client_handshake(mut stream: T, info: BtHandshakeInfo) -> Result<BtStream<T> , BtError> {
-        utils::write_handshake(&mut stream, &info).await?;
-        let (info_hash, peer_id, has_ext) = utils::read_handshake(&mut stream).await?;
-        if info_hash != info.hash { // Info Hash mismatch
-            return Err(BtError::HandshakeFailed);
-        }
+    /// Do the ext handshake (if needed) between client and server and than build it
+    /// 
+    /// `request`: The handshake request from remote
+    /// 
+    /// `info`: The handshake info of local
+    async fn build(mut stream: T, request: BtHandshakeRequest, info: BtHandshakeInfo) -> Result<BtStream<T> , BtError> {
         let mut read_buf = Vec::new();
         let mut write_buf = Vec::new();
 
         // Begin the ext handshake
-        let extensions = if has_ext && info.extensions.is_some() {
+        let extensions = if request.extensions && info.extensions.is_some() {
             // Write our handle shake out
             let out_msg = BtMessage::Extended { id: 0, msg: info.extensions.as_ref().unwrap().clone(), payload: Vec::new() };
             utils::write_message(&mut stream, &mut write_buf, &out_msg).await?;
@@ -482,12 +494,29 @@ impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
                 write_buf: write_buf,
                 local_info: info,
                 peer_info: BtHandshakeInfo {
-                    hash: info_hash,
-                    peer_id: peer_id,
+                    hash: request.hash,
+                    peer_id: request.peer_id,
                     extensions: extensions
                 }
             }
         );
+    }
+
+    /// Handshake like an client
+    pub async fn client_handshake(mut stream: T, info: BtHandshakeInfo) -> Result<BtStream<T> , BtError> {
+        utils::write_handshake(&mut stream, &info).await?;
+        let request = utils::read_handshake(&mut stream).await?;
+        if request.hash != info.hash { // Info Hash mismatch
+            return Err(BtError::HandshakeFailed);
+        }
+        return BtStream::build(stream, request, info).await;
+    }
+
+    /// Handshake like an server, and call the callback to get the handshake info
+    pub async fn server_handshake(mut stream: T, cb: impl FnOnce(&BtHandshakeRequest) -> Result<BtHandshakeInfo, BtError>) -> Result<BtStream<T> , BtError> {
+        let request = utils::read_handshake(&mut stream).await?;
+        let info = cb(&request)?;
+        return BtStream::build(stream, request, info).await;
     }
 
     /// Read an message from the stream
