@@ -520,6 +520,8 @@ impl UtpListener {
                 ))
             }
         };
+        // Set the connected flag
+        sock.inner.state.lock().unwrap().connected = true;
         return Ok((sock, addr));
     }
 }

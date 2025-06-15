@@ -1,6 +1,6 @@
 #![allow(dead_code)] // Let it shutup!
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -42,6 +42,22 @@ pub enum FindNodeError {
     #[error("No node found")]
     AllFailed, // We try to do rpc to the nodes, but all failed, no-one give us reply
 }
+
+#[derive(Debug)]
+pub struct GetPeersResult {
+    pub nodes: Vec<GetPeersNode>, // The nodes we found, id, ip, token
+    pub peers: Vec<SocketAddr>
+}
+
+
+#[derive(Debug)]
+pub struct GetPeersNode {
+    pub id: NodeId,
+    pub ip: SocketAddr,
+    pub token: Vec<u8>
+}
+
+type GetPeersError = FindNodeError;
 
 type NodeEndpoint = (NodeId, SocketAddr);
 
@@ -135,18 +151,18 @@ impl DhtSession {
         }
     }
     
-    // Doing the find logical
+    /// Doing the find logical of find_node
     async fn find_node_impl(&self, mut queue: Vec<NodeEndpoint>, target: NodeId) -> Result<Vec<NodeEndpoint>, FindNodeError> {
         sort_node_and_unique(&mut queue, target);
         let mut join_set = JoinSet::new();
-        let mut visited = BTreeSet::new();
+        let mut visited = HashSet::new();
         let mut collected = Vec::new();
         let mut output = Vec::new();
         let mut iteration_with_convergence = 0;
         let mut queries_completed = 0; // The number of queries completed
         while queries_completed < MAX_ITERATIONS * NUM_QUERIES_PER_ITERATION {
             if queue.is_empty() && join_set.is_empty() {
-                warn!("No more nodes to query, stopping the search.");
+                warn!("No more nodes to query(find_node), stopping the search.");
                 break;
             }
             if join_set.len() < MAX_ALPHA {
@@ -235,11 +251,136 @@ impl DhtSession {
         return Ok(output);
     }
 
+    async fn get_peers_impl(&self, mut queue: Vec<(NodeId, SocketAddr)>, hash: InfoHash) -> Result<GetPeersResult, GetPeersError> {
+        let mut peers = Vec::new(); // The peers we found
+        let mut collected = Vec::new(); // The nodes we found when get_peers
+        let mut nearest = Vec::new(); // The K-nearest nodes
+        let mut visited = HashMap::new(); // The nodes we visited, map ip to the token
+        let mut join_set = JoinSet::new();
+        let mut iteration_with_convergence = 0;
+        let mut queries_completed = 0; // The number of queries completed
+
+        // The code as same as find_node_impl
+        while queries_completed < MAX_ITERATIONS * NUM_QUERIES_PER_ITERATION {
+            if queue.is_empty() && join_set.is_empty() {
+                warn!("No more nodes to query(get_peers), stopping the search.");
+                break;
+            }
+            if join_set.len() < MAX_ALPHA {
+                // We can spawn more futures
+                let num = std::cmp::min(MAX_ALPHA - join_set.len(), queue.len());
+
+                for (id, ip) in queue.drain(0..num) {
+                    // Send the find_node request
+                    let msg = GetPeersQuery {
+                        id: self.inner.id,
+                        info_hash: hash,
+                    };
+
+                    let fut = self.clone().do_krpc(msg, id, ip);
+                    join_set.spawn(fut);
+                }
+            }
+
+            // Try to wait one future to complete
+            let res = match join_set.join_next().await {
+                Some(res) => res,
+                None => continue,
+            };
+            // One future completed, check the result
+            queries_completed += 1;
+            let (result, ip) = match res {
+                Ok(what) => what,
+                Err(_) => continue, // Set is empty...
+            };
+            let reply = match result {
+                Ok(reply) => reply,
+                Err(_) => {
+                    visited.insert(ip.clone(), Vec::new()); // Mark failed as visited
+                    continue;
+                }
+            };
+            // Try add it to the routing table, it give us reply
+            let _ = self.routing_table_mut().add_node(reply.id, &ip);
+            visited.insert(ip, reply.token);
+
+            // Update the nodes...
+            for (id, ip) in reply.nodes.iter() {
+                if !self.is_native_addr(ip) {
+                    continue; // Skip the non-native addresses
+                }
+                if visited.contains_key(ip) {
+                    continue; // Already visited this node
+                }
+                queue.push((*id, *ip));
+            }
+            peers.extend_from_slice(reply.values.as_slice());
+            collected.extend_from_slice(reply.nodes.as_slice());
+            
+            peers.sort();
+            peers.dedup();
+            sort_node_and_unique(&mut queue, hash);
+            sort_node_and_unique(&mut collected, hash);
+
+            // Check if the K-nearest nodes are the same, if so more than 3 iterations, we can stop
+            let collected_len = collected.len().min(8);
+            let len = nearest.len().min(collected_len);
+            if nearest[0..len] != collected[0..len] || len < 8 { // If the nearest is not the same as collected(0..K), or we have less than 8 nodes
+                // Update the K-nearest nodes
+                nearest.clear();
+                nearest.extend_from_slice(&collected[0..collected_len]);
+                iteration_with_convergence = 0; // Reset the convergence counter
+            }
+            else {
+                iteration_with_convergence += 1;
+                if iteration_with_convergence >= NUM_QUERIES_PER_ITERATION * MAX_ITERATIONS_WITH_CONVERGENCE {
+                    debug!("Convergence reached, stopping the search.");
+                    break; // We have convergence, stop the search
+                }
+            }
+            
+            // Avoid to grow too large
+            queue.truncate(8 * 8);
+            collected.truncate(8 * 8);
+
+            warn!("get_peers: queries_completed {queries_completed}, iteration_with_convergence {iteration_with_convergence}");
+        }
+
+        // Done
+        let mut nodes = Vec::new();
+        let null = Vec::new();
+        for (id, ip) in collected.iter() {
+            let token = visited.get(ip).unwrap_or(&null);
+            if token.is_empty() {
+                continue;
+            }
+            nodes.push(GetPeersNode { id: *id, ip: *ip, token: token.clone() });
+            if nodes.len() >= 8 {
+                break;
+            }
+        }
+
+        join_set.shutdown().await;
+        if peers.is_empty() && collected.is_empty() {
+            return Err(GetPeersError::AllFailed);
+        }
+        return Ok(GetPeersResult {
+            peers: peers,
+            nodes: nodes,
+        });
+    }
+
     /// Find the nodes for the target node id, return the K-nearest nodes
     pub async fn find_node(self, target: NodeId) -> Result<Vec<NodeEndpoint>, FindNodeError> {
         // Get the nodes from routing table
         let queue = self.routing_table_mut().find_node(target);
         return self.find_node_impl(queue, target).await;
+    }
+
+    /// Get the peers for the given infohash, return the peers and the K-nearest nodes
+    pub async fn get_peers(self, hash: InfoHash) -> Result<GetPeersResult, GetPeersError> {
+        let queue = self.routing_table_mut().find_node(hash);
+        return self.get_peers_impl(queue, hash).await;
     }
 
     /// Ping the nodes for the given ips

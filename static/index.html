@@ -416,10 +416,10 @@
         
             <div class="tool-section">
                 <h3>Get Peers</h3>
-                <div class="form-group">
+                <!-- <div class="form-group">
                     <label for="tools-getpeers-addr-input">节点地址 (IP:Port)</label>
                     <input type="text" id="tools-getpeers-addr-input" placeholder="目标节点地址">
-                </div>
+                </div> -->
                 <div class="form-group">
                     <label for="tools-getpeers-hash-input">Info Hash (40个十六进制字符)</label>
                     <div class="input-group">
@@ -721,6 +721,10 @@
                  throw new Error(`HTTP error! status: ${response.status}`);
             }
             const json = await response.json();
+            const error = json.error;
+            if (error != null) {
+                throw new Error(error);
+            }
             displaySearchResults(json.results);
             renderPaginationControls(json.totalPages, json.currentPage);
         }
@@ -938,9 +942,9 @@
                     if (!payload.address) throw new Error('节点地址不能为空');
                     break;
                 case 'get_peers':
-                    payload.address = document.getElementById('tools-getpeers-addr-input').value;
+                    // payload.address = document.getElementById('tools-getpeers-addr-input').value;
                     payload.info_hash = document.getElementById('tools-getpeers-hash-input').value;
-                    if (!payload.address || !payload.info_hash) throw new Error('地址和 Info Hash 不能为空');
+                    // if (!payload.address || !payload.info_hash) throw new Error('地址和 Info Hash 不能为空');
                     break;
                 case 'announce_peer':
                     payload.address = document.getElementById('tools-announce-addr-input').value;

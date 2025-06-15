@@ -3,12 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet}, 
     fs, 
-    io::{self, Write}, 
+    io::{Write}, 
     net::SocketAddr, 
     sync::{Arc, Mutex, MutexGuard}
 };
 use tokio::{
-    io::AsyncReadExt, net, task::JoinHandle
+    net, task::JoinHandle
 };
 use axum::{
     Router, 
@@ -31,7 +31,7 @@ use dht_rs::{
     *
 };
 
-use tracing::{info, error};
+use tracing::{info};
 
 #[derive(Deserialize, Serialize, Clone)]
 struct Config {
@@ -61,7 +61,8 @@ struct Metadata {
 struct AppInner {
     config: Mutex<Config>,
     crawler: Mutex<Option<(Crawler, JoinHandle<()>)> >, // The cralwer and its task handle
-    info_hashes: Mutex<BTreeSet<InfoHash> >
+    info_hashes: Mutex<BTreeSet<InfoHash> >,
+    storage: Storage, // The database 
 }
 
 #[derive(Clone)]
@@ -88,30 +89,20 @@ impl CrawlerObserver for AppInner {
     }
 
     fn has_metadata(&self, hash: InfoHash) -> bool {
-        return fs::exists(format!("./data/torrents/{}.torrent", hash)).unwrap_or(false);
+        return self.storage.has_torrent(hash).unwrap_or(false);
     }
 
-    fn on_metadata_downloaded(&self, hash: InfoHash, data: Vec<u8>) {
+    fn on_metadata_downloaded(&self, _hash: InfoHash, data: Vec<u8>) {
         let torrent = Torrent::from_info_bytes(&data).expect("It should never failed");
-        let data = torrent.object().encode();
-        let mut file = match fs::File::create(format!("./data/torrents/{}.torrent", hash)) {
-            Ok(file) => file,
-            Err(err) => {
-                error!("Can not create the file: {}", err);
-                return;
-            }
-        };
-        if let Err(err) = file.write_all(&data) {
-            error!("Can not write the file: {}", err);
-        }
+        let _ = self.storage.add_torrent(&torrent);
     }
 }
 
 impl App {
     pub fn new() -> App {
         // Check dir exists
-        if fs::exists("./data/torrents").unwrap() == false {
-            fs::create_dir_all("./data/torrents").unwrap();
+        if fs::exists("./data").unwrap() == false {
+            fs::create_dir_all("./data").unwrap();
         }
 
         // Try to load config from the disk
@@ -136,6 +127,7 @@ impl App {
                     config: Mutex::new(config),
                     crawler: Mutex::new(None),
                     info_hashes: Mutex::new(BTreeSet::new()),
+                    storage: Storage::open("./data/torrents.db").expect("Can not open the storage database"),
                 }
             )
         };
@@ -278,89 +270,69 @@ impl App {
     }
 
     // Search
-    async fn search_metadata_handler_impl(State(_app): State<App>, extract::Json(search): extract::Json<MetadataSearch>) -> Result<String, io::Error> {
-        let length_to_string = |length: u64| {
-            if length < 1024 {
-                return format!("{} bytes", length);
+    async fn search_metadata_handler_impl(State(app): State<App>, extract::Json(search): extract::Json<MetadataSearch>) -> Result<Value, storage::Error> {
+        let size_to_string = |size: u64| {
+            if size < 1024 {
+                return format!("{} bytes", size);
             }
-            if length < 1024 * 1024 {
-                return format!("{} KB", length / 1024);
+            if size < 1024 * 1024 {
+                return format!("{} KB", size / 1024);
             }
-            if length < 1024 * 1024 * 1024 {
-                return format!("{} MB", length / 1024 / 1024);
+            if size < 1024 * 1024 * 1024 {
+                return format!("{} MB", size / 1024 / 1024);
             }
-            return format!("{} GB", length / 1024 / 1024 / 1024);
+            return format!("{} GB", size / 1024 / 1024 / 1024);
         };
 
-        let _pattern = search.query;
-        let page = search.page;
-        // Enumerate all the files in in torrents folder
+        let pattern = search.query;
+        let page = search.page.saturating_sub(1); // Page is 1-indexed, to 0-indexed
         let mut items = Vec::new();
-        let mut items_len = 0; // The number of max item
-        let mut entries = tokio::fs::read_dir("./data/torrents").await?;
-        // Broswer from filesystem
-        while let Some(entry) = entries.next_entry().await? {
-            items_len += 1;
-            if page * MAX_SEARCH_PER_PAGES < items_len - 1 {
-                continue;
-            }
-            if (page + 1) * MAX_SEARCH_PER_PAGES <= items_len - 1 {
-                continue; // We need the count of items to calc the max page
-            }
-            let mut file = tokio::fs::File::open(entry.path()).await?;
-            let mut vec = Vec::new();
-            file.read_to_end(&mut vec).await?;
-            let filename = entry.file_name().into_string().unwrap();
-
-            // Parse the torrent
-            let torrent = Torrent::from_bytes(&vec).
-                ok_or(io::Error::new(io::ErrorKind::Other, "Invalid torrent file"))?;
-            let hash_name = filename.split('.').next().unwrap_or(filename.as_str());
+        let info = app.inner.storage.search_torrent(&pattern, (page * MAX_SEARCH_PER_PAGES) as u64, MAX_SEARCH_PER_PAGES as u64)?;
+        for torrent in info.torrents.iter() {
             let mut files = Vec::new();
 
-            for (name, length) in torrent.files() {
+            for file in torrent.files.iter() {
                 files.push(json!({
-                    "name": name,
-                    "size": length_to_string(length),
+                    "name": file.name.clone(),
+                    "size": size_to_string(file.size),
                 }));
             }
+
             items.push(Metadata {
-                info_hash: hash_name.to_string(),
-                name: Some(torrent.name().into()),
-                size: Some(length_to_string(torrent.length())),
+                info_hash: torrent.hash.hex(),
+                name: Some(torrent.name.clone()),
+                size: Some(size_to_string(torrent.size)),
                 files: Some(json!(files)),
-            });
-        }
-        // Broswer from the memory
-        for hash in _app.inner.info_hashes.lock().unwrap().iter() {
-            items_len += 1;
-            if page * MAX_SEARCH_PER_PAGES < items_len - 1 {
-                continue;
-            }
-            if (page + 1) * MAX_SEARCH_PER_PAGES <= items_len -1 {
-                continue; // We need the count of items to calc the max page
-            }
-            items.push(Metadata {
-                info_hash: hash.hex(),
-                .. Default::default()
-            });
+            })
         }
 
         let json = json!({
             "results": items,
-            "totalPages": items_len / MAX_SEARCH_PER_PAGES,
+            "totalPages": info.total / MAX_SEARCH_PER_PAGES as u64,
             "currentPage": search.page,
         });
-        return Ok(json.to_string());
+        return Ok(json);
+    }
+
+    async fn search_metadata_handler(app: State<App>, json: extract::Json<MetadataSearch>) -> impl IntoResponse {
+        return match App::search_metadata_handler_impl(app, json).await {
+            Ok(json) => Json(json),
+            Err(err) => Json(json!({
+                "error": format!("Error to search metadata ({err})")
+            })),
+        }
     }
 
     // Tools
     async fn tools_handler_impl(session: DhtSession, path: String, json: Value) -> Result<Value, String> {
         // Get the address..
-        let addr = json["address"].as_str().ok_or("Missing address in json")?;
-        let addr = addr.parse::<SocketAddr>().map_err(|err| err.to_string() )?;
+        let get_addr = |json: &Value| -> Result<SocketAddr, String> {
+            let addr = json["address"].as_str().ok_or("Missing address in json")?;
+            return addr.parse::<SocketAddr>().map_err(|err| err.to_string() );
+        };
         match path.as_str() {
             "ping" => {
+                let addr = get_addr(&json)?;
                 let res = session.ping(addr).await;
                 let id = res.map_err(|e| e.to_string() )?;
                 return Ok(json!({
@@ -370,6 +342,7 @@ impl App {
             "sample_infohashes" => {
                 let target = json["target"].as_str().ok_or("Missing target in json")?;
                 let target = NodeId::from_hex(target).ok_or("Invalid target")?;
+                let addr = get_addr(&json)?;
                 let reply = session.sample_infohashes(addr, target).await.map_err(|e| {
                     return e.to_string()
                 })?;
@@ -389,6 +362,26 @@ impl App {
                     "interval": reply.interval,
                     "nodes": nodes,
                     "info_hashes": info_hashes,
+                }));
+            }
+            "get_peers" => {
+                let info_hash = json["info_hash"].as_str().ok_or("Missing info_hash in json")?;
+                let info_hash = InfoHash::from_hex(info_hash).ok_or("Invalid info_hash")?;
+                let reply = session.get_peers(info_hash).await.map_err(|e| {
+                    return e.to_string()
+                })?;
+                // Convert it
+                let nodes: Vec<Value> = reply.nodes.iter().map(|node| {
+                    return json!({
+                        "id": node.id.hex(),
+                        "ip": node.ip.to_string(),
+                        // "token": node.token.hex(),
+                    });
+                }).collect();
+
+                return Ok(json!({
+                    "nodes": nodes,
+                    "peers": reply.peers,
                 }));
             }
             _ => {
@@ -415,12 +408,5 @@ impl App {
             })),
         }
 
-    }
-
-    async fn search_metadata_handler(app: State<App>, json: extract::Json<MetadataSearch>) -> impl IntoResponse {
-        return match App::search_metadata_handler_impl(app, json).await {
-            Ok(json) => json,
-            Err(err) => format!("Error to search metadata ({err})"),
-        }
     }
 }

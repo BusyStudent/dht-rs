@@ -1,12 +1,16 @@
 pub mod bencode;
 pub mod crawler;
+pub mod storage;
 pub mod core;
 pub mod krpc;
 pub mod dht;
 pub mod utp;
 pub mod bt;
+pub use bt::PeerId;
+pub use bt::Torrent;
 pub use core::NodeId;
 pub use core::InfoHash;
+pub use storage::Storage;
 
 pub fn hello_world() {
     println!("Hello world");
