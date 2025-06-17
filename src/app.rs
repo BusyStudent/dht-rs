@@ -27,7 +27,6 @@ use serde_json::{
 use dht_rs::{
     bt::Torrent, 
     crawler::{Crawler, CrawlerConfig, CrawlerObserver}, 
-    dht::DhtSession, 
     *
 };
 
@@ -164,12 +163,46 @@ impl App {
         };
         let listener = net::TcpListener::bind(addr).await.unwrap();
         println!("WebUI Listening on http://{}/", listener.local_addr().unwrap());
-        let _ = axum::serve(listener, router).await;
+        let _ = axum::serve(listener, router)
+            .with_graceful_shutdown(self.clone().shutdown_signal())
+            .await;
     }
 
     // Helper function to get the config
     fn config(&self) -> MutexGuard<Config> {
         return self.inner.config.lock().unwrap();
+    }
+
+    // Shutdown signal
+    async fn shutdown_signal(self) {
+        let ctrl_c = async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("Failed to install Ctrl-C handler");
+        };
+
+        tokio::select! {
+            _ = ctrl_c => { info!("Shutdown signal received, cleanup..."); },
+        }
+
+        // Shutdown the DHT if it's running
+        self.stop_dht().await;
+    }
+
+    // Stop the DHT
+    // Return true if the DHT is running, false on already stopped
+    async fn stop_dht(&self) -> bool {
+        let (_crawler, handle) = {
+            let mut lock = self.inner.crawler.lock().unwrap();
+            match lock.take() {
+                Some(what) => what,
+                None => return false,
+            }
+        };
+        handle.abort();
+        let _ = handle.await;
+        info!("DHT Stopped");
+        return true;
     }
 
     // Basic API
@@ -206,21 +239,11 @@ impl App {
         return String::from("DHT started");
     }
 
-    async fn stop_dht_handler(State(_app): State<App>) -> impl IntoResponse {
-        let (_crawler, handle) = {
-            let mut crawler = _app.inner.crawler.lock().unwrap();
-            let mut cur: Option<_> = None;
-            std::mem::swap(&mut *crawler, &mut cur);
-
-            match cur {
-                Some(what) => what,
-                None => return "DHT already stopped",
-            }
-        };
-        handle.abort();
-        let _ = handle.await;
-        info!("DHT Stopped");
-        return "DHT stopped";
+    async fn stop_dht_handler(State(app): State<App>) -> impl IntoResponse {
+        if app.stop_dht().await {
+            return String::from("DHT stopped");
+        }
+        return String::from("DHT already stopped");
     }
 
     async fn is_dht_running_handler(State(app): State<App>) -> impl IntoResponse {
@@ -305,6 +328,7 @@ impl App {
                 files: Some(json!(files)),
             })
         }
+        // Add 
 
         let json = json!({
             "results": items,
@@ -324,12 +348,13 @@ impl App {
     }
 
     // Tools
-    async fn tools_handler_impl(session: DhtSession, path: String, json: Value) -> Result<Value, String> {
+    async fn tools_handler_impl(crawler: Crawler, path: String, json: Value) -> Result<Value, String> {
         // Get the address..
         let get_addr = |json: &Value| -> Result<SocketAddr, String> {
             let addr = json["address"].as_str().ok_or("Missing address in json")?;
             return addr.parse::<SocketAddr>().map_err(|err| err.to_string() );
         };
+        let session = crawler.dht_session().clone();
         match path.as_str() {
             "ping" => {
                 let addr = get_addr(&json)?;
@@ -372,10 +397,14 @@ impl App {
                 })?;
                 // Convert it
                 let nodes: Vec<Value> = reply.nodes.iter().map(|node| {
+                    let mut token = String::new();
+                    for byte in node.token.iter() {
+                        token.push_str(&format!("{:02x}", byte));
+                    }
                     return json!({
                         "id": node.id.hex(),
                         "ip": node.ip.to_string(),
-                        // "token": node.token.hex(),
+                        "token": token,
                     });
                 }).collect();
 
@@ -383,6 +412,14 @@ impl App {
                     "nodes": nodes,
                     "peers": reply.peers,
                 }));
+            }
+            "add_hash" => {
+                let info_hash = json["info_hash"].as_str().ok_or("Missing info_hash in json")?;
+                let info_hash = InfoHash::from_hex(info_hash).ok_or("Invalid info_hash")?;
+                crawler.add_hash(info_hash);
+                return Ok(json!({
+                    "status": "success"
+                }))
             }
             _ => {
                 return Err("Invalid tool".into());
@@ -392,16 +429,16 @@ impl App {
 
     async fn tools_handler(State(app): State<App>, Path(tool): Path<String>, extract::Json(json): extract::Json<Value>) -> impl IntoResponse {
         info!("Calling tools {tool} handler with args {json}");
-        let session = {
+        let crawler = {
             let mtx = app.inner.crawler.lock().unwrap();
             match &*mtx {
-                Some((cralwer, _)) => cralwer.dht_session().clone(),
+                Some((cralwer, _)) => cralwer.clone(),
                 None => return Json(json!({
                     "error": "No crawler is running"
                 })),
             }
         };
-        match App::tools_handler_impl(session.clone(), tool, json).await {
+        match App::tools_handler_impl(crawler, tool, json).await {
             Ok(val) => return Json(val),
             Err(err) => return Json(json!({
                 "error" : err 

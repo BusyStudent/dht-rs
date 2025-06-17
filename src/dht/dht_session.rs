@@ -18,6 +18,7 @@ const NUM_QUERIES_PER_ITERATION: usize = 3; // The queries of per iterations
 const MAX_ITERATIONS_WITH_CONVERGENCE: usize = 3; // The max iterations with convergence
 const MAX_ITERATIONS: usize = 16; // The max iterations of the find_node / get_peers
 const MAX_ALPHA: usize = 10; // Use more cocorrent requests, to speed up the process
+const MAX_PEERS: usize = 100; // The max peers we can get from the get_peers
 
 type OnPeerAnnounceCallback = Box<dyn Fn(InfoHash, SocketAddr) + Send>;
 
@@ -266,6 +267,9 @@ impl DhtSession {
                 warn!("No more nodes to query(get_peers), stopping the search.");
                 break;
             }
+            if peers.len() >= MAX_PEERS {
+                break;
+            }
             if join_set.len() < MAX_ALPHA {
                 // We can spawn more futures
                 let num = std::cmp::min(MAX_ALPHA - join_set.len(), queue.len());
@@ -374,12 +378,18 @@ impl DhtSession {
     pub async fn find_node(self, target: NodeId) -> Result<Vec<NodeEndpoint>, FindNodeError> {
         // Get the nodes from routing table
         let queue = self.routing_table_mut().find_node(target);
+        if queue.is_empty() {
+            warn!("No nodes found in the routing table when finding node");
+        }
         return self.find_node_impl(queue, target).await;
     }
 
     /// Get the peers for the given infohash, return the peers and the K-nearest nodes
     pub async fn get_peers(self, hash: InfoHash) -> Result<GetPeersResult, GetPeersError> {
         let queue = self.routing_table_mut().find_node(hash);
+        if queue.is_empty() {
+            warn!("No nodes found in the routing table when getting peers");
+        }
         return self.get_peers_impl(queue, hash).await;
     }
 
@@ -392,6 +402,27 @@ impl DhtSession {
         return Ok(reply?.id);
     }
 
+    /// Announce the given infohash to the given node
+    /// 
+    /// `ip` The ip of the node
+    /// 
+    /// `hash` The infohash to announce
+    /// 
+    /// `port` The port to announce, if None, use implied port and the default port 6881
+    /// 
+    /// `token` The token to announce, can't be empty
+    pub async fn announce_peer(self, ip: SocketAddr, hash: InfoHash, port: Option<u16>, token: Vec<u8>) -> Result<(), KrpcError> {
+        let msg = AnnouncePeerQuery {
+            id: self.inner.id,
+            info_hash: hash,
+            port: port.unwrap_or(6881),
+            implied_port: port.is_none(),
+            token: token,
+        };
+        let (_reply, _) = self.do_krpc(msg, NodeId::zero(), ip).await;
+        return Ok(());
+    }
+
     /// Sample the infohashes from the given node
     pub async fn sample_infohashes(self, ip: SocketAddr, target: NodeId) -> Result<SampleInfoHashesReply, KrpcError> {
         let msg = SampleInfoHashesQuery {
@@ -402,7 +433,7 @@ impl DhtSession {
         return Ok(reply);
     }
     
-    // Process the incoming udp packet
+    /// Process the incoming udp packet
     pub async fn process_udp(&self, bytes: &[u8], ip: &SocketAddr) -> bool {
         let query = match self.inner.krpc.process_udp(bytes, ip) {
             KrpcProcess::Query(query) => query,

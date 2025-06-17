@@ -135,13 +135,24 @@ impl RoutingTable {
 
     /// Find the closest nodes of the target, the return's max len is K
     pub fn find_node(&self, target: NodeId) -> Vec<(NodeId, SocketAddr)> {
-        let idx = self.calc_bucket_index(target);
+        let mut idx = self.calc_bucket_index(target);
         let mut res = Vec::new();
-        for bucket in (&self.buckets[0..=idx]).iter().rev() {
+        let forward = idx < self.buckets.len() / 2; // If the idx is on the front side, we should find the forward nodes
+        loop {
+            let bucket = &self.buckets[idx];
             for node in &bucket.nodes {
                 res.push((node.id, node.ip));
             }
             if res.len() >= KBUCKET_SIZE {
+                break;
+            }
+            if forward {
+                idx += 1;
+            }
+            else if idx > 0 {
+                idx -= 1;
+            }
+            if idx == 0 || idx == self.buckets.len() - 1 { // Reach the edge
                 break;
             }
         }

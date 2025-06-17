@@ -1,26 +1,31 @@
 #![allow(dead_code, unused_imports)] // Let it shutup!
 
 use crate::{
-    bt::*, crawler::downloader::Downloader, dht::*, krpc::*, utp::UtpContext, InfoHash, NodeId
+    bt::*,
+    crawler::{
+        downloader::{Downloader, DownloaderController},
+        peer_finder::{PeerFinder, PeerFinderConfig},
+    },
+    dht::*,
+    krpc::*,
+    utp::UtpContext,
+    InfoHash, NodeId,
 };
 use std::{
-    collections::BTreeSet, 
-    io, 
-    net::SocketAddr, 
-    sync::{Arc, Mutex, MutexGuard}
+    collections::BTreeSet,
+    io,
+    net::SocketAddr,
+    sync::{Arc, Mutex, MutexGuard},
 };
-use tracing::{info, error};
-use tokio::{
-    net::UdpSocket,
-    sync::Semaphore,
-    task::JoinSet,
-};
+use tokio::{net::UdpSocket, sync::{Semaphore, mpsc}, task::JoinSet};
+use tracing::{error, info};
 
 struct CrawlerInner {
     udp: Arc<UdpSocket>,
     dht_session: DhtSession,
     utp_context: UtpContext,
     downloader: Downloader,
+    peer_finder: PeerFinder,
     observer: Arc<dyn CrawlerObserver + Send + Sync>,
 }
 
@@ -43,7 +48,7 @@ pub trait CrawlerObserver {
     }
 
     fn on_metadata_downloaded(&self, _info_hash: InfoHash, _data: Vec<u8>) {
-        // 
+        //
     }
 
     /// Check did we has this metadata?
@@ -59,24 +64,38 @@ impl Crawler {
         let utp = UtpContext::new(udp.clone());
         let mut session = DhtSession::new(config.id, krpc);
 
+        let finder_config = PeerFinderConfig {
+            dht_session: session.clone(),
+            max_concurrent: 5,
+            max_retries: 3,
+        };
+
         let this = Crawler {
             inner: Arc::new(CrawlerInner {
                 udp: udp,
                 dht_session: session.clone(),
                 utp_context: utp.clone(),
-                downloader: Downloader::new(utp, config.observer.clone()),
+                downloader: Downloader::new(utp),
+                peer_finder: PeerFinder::new(finder_config),
                 observer: config.observer,
             }),
         };
 
         // Set the callback of it
         let weak = Arc::downgrade(&this.inner);
-        session.set_on_peer_announce(Box::new(move |info_hash, addr| {
-            match weak.upgrade() {
-                Some(this) => Crawler::on_peer_announce(this, info_hash, addr),
-                None => {}
-            }
+        session.set_on_peer_announce(Box::new(move |info_hash, addr| match weak.upgrade() {
+            Some(this) => Crawler::on_peer_announce(this, info_hash, addr),
+            None => {}
         }));
+
+        let weak = Arc::downgrade(&this.inner);
+        this.inner.peer_finder.set_callback(Box::new(move |info_hash, addr| match weak.upgrade() {
+            Some(this) => Crawler::on_peer_found(this, info_hash, addr),
+            None => {}
+        }));
+
+        // Set the controller
+        this.inner.downloader.set_controller(this.inner.clone());
 
         return Ok(this);
     }
@@ -106,8 +125,16 @@ impl Crawler {
         }
     }
 
+    /// From dht session
     fn on_peer_announce(inner: Arc<CrawlerInner>, info_hash: InfoHash, ip: SocketAddr) {
         inner.observer.on_info_hash_found(info_hash);
+        if !inner.observer.has_metadata(info_hash) {
+            inner.downloader.add_peer(info_hash, ip);
+        }
+    }
+
+    /// From peer finder
+    fn on_peer_found(inner: Arc<CrawlerInner>, info_hash: InfoHash, ip: SocketAddr) {
         if !inner.observer.has_metadata(info_hash) {
             inner.downloader.add_peer(info_hash, ip);
         }
@@ -117,13 +144,29 @@ impl Crawler {
     pub fn dht_session(&self) -> &DhtSession {
         return &self.inner.dht_session;
     }
+    
+    pub fn add_hash(&self, info_hash: InfoHash) {
+        return self.inner.peer_finder.add_hash(info_hash);
+    }
 
     /// Start the crawler
     pub async fn run(self) {
         tokio::join!(
-            self.process_udp(), // The network loop
+            self.process_udp(),           // The network loop
             self.inner.dht_session.run(), // The dht loop
             self.inner.downloader.run()   // The download loop
         );
+    }
+}
+
+// Delegate the downloader controller to the crawler
+impl DownloaderController for CrawlerInner {
+    fn on_metadata_downloaded(&self, info_hash: InfoHash, data: Vec<u8>) {
+        self.peer_finder.cancel(info_hash); // Cancel the peer finding, we got the metadata
+        return self.observer.on_metadata_downloaded(info_hash, data);
+    }
+
+    fn has_metadata(&self, info_hash: InfoHash) -> bool {
+        return self.observer.has_metadata(info_hash);
     }
 }

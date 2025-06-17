@@ -468,6 +468,17 @@
                 <button class="button tool-btn" data-tool="sample_infohashes">发送 Sample Infohashes</button>
                 <pre id="tools-sample-infohashes-response" class="tool-response">响应将显示在此处</pre>
             </div>
+
+            <div class="tool-section">
+                <h3>Add Hash</h3>
+                <div class="form-group">
+                    <label for="tools-add-hash-input">Info Hash (40个十六进制字符)</label>
+                    <div class="input-group">
+                        <input type="text" id="tools-add-hash-input">
+                    </div>
+                </div>
+                <button class="button tool-btn" data-tool="add_hash">添加到索引 尝试获取元数据</button>
+                <pre id="tools-add-hash-response" class="tool-response">响应将显示在此处</pre>
         </div>
 
     </div>
@@ -957,6 +968,9 @@
                     payload.address = document.getElementById('tools-sample-addr-input').value;
                     payload.target = document.getElementById('tools-sample-target-input').value;
                     if (!payload.address || !payload.target) throw new Error('地址和目标 Node ID 不能为空');
+                    break;
+                case 'add_hash':
+                    payload.info_hash = document.getElementById('tools-add-hash-input').value;
                     break;
                 default:
                     throw new Error(`未知的工具: ${toolName}`);

@@ -2,7 +2,6 @@
 
 use crate::utp::*;
 use crate::bt::*;
-use crate::crawler::CrawlerObserver;
 use crate::InfoHash;
 use sha1::Digest;
 use tokio::io::AsyncRead;
@@ -14,7 +13,7 @@ use tracing::warn;
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Mutex, Weak, OnceLock},
     time::Duration,
     io
 };
@@ -33,14 +32,19 @@ struct DownloadState {
 struct DownloaderInner {
     state: Mutex<DownloadState>,
     start_worker: broadcast::Sender<InfoHash>,
-    observer: Arc<dyn CrawlerObserver + Sync + Send>,
+    controller: OnceLock<Arc<dyn DownloaderController + Sync + Send> >,
     utp_context: UtpContext,
 }
 
-pub struct DownloaderConfig {
-    observer: Arc<dyn CrawlerObserver + Sync + Send>,
-    utp_context: UtpContext,
-    peer_id: PeerId,
+// pub struct DownloaderConfig {
+//     controller: Arc<dyn CrawlerObserver + Sync + Send>,
+//     utp_context: UtpContext,
+//     peer_id: PeerId,
+// }
+
+pub trait DownloaderController {
+    fn on_metadata_downloaded(&self, info_hash: InfoHash, data: Vec<u8>);
+    fn has_metadata(&self, info_hash: InfoHash) -> bool;
 }
 
 /// It is responsible for downloading the metadata of given hash and ip.
@@ -51,7 +55,7 @@ pub struct Downloader {
 
 impl Downloader {
     // Create an downloader
-    pub fn new(ctxt: UtpContext, observer: Arc<dyn CrawlerObserver + Sync + Send>) -> Downloader {
+    pub fn new(ctxt: UtpContext) -> Downloader {
         let (sx, _rx) = broadcast::channel(114514);
         let downloader = Downloader {
             inner: Arc::new(DownloaderInner {
@@ -62,7 +66,7 @@ impl Downloader {
                     }
                 ),
                 start_worker: sx.clone(),
-                observer: observer,
+                controller: OnceLock::new(),
                 utp_context: ctxt,
             }),
         };
@@ -122,12 +126,14 @@ impl Downloader {
         let peers = locked.map.get(&hash)?;
         return Some(peers.first()?.clone());
     }
+
     fn clear_peer(&self, hash: InfoHash, ip: SocketAddr) -> Option<()> {
         let mut locked = self.inner.state.lock().unwrap();
         let peers = locked.map.get_mut(&hash)?;
         peers.remove(&ip);
         return Some(());
     }
+
     fn done_job(&self, hash: InfoHash) {
         let mut locked = self.inner.state.lock().unwrap();
         locked.map.remove(&hash);
@@ -165,7 +171,8 @@ impl Downloader {
 
             // Save it
             self.done_job(hash);
-            self.inner.observer.on_metadata_downloaded(hash, torrent);
+            self.inner.controller.wait()
+                .on_metadata_downloaded(hash, torrent);
             return;
         }
         info!("Downloading metadata for {} suspended, no more peers available", hash);
@@ -259,8 +266,8 @@ impl Downloader {
     async fn handle_incoming(self, stream: UtpSocket) -> Result<(), BtError>{
         let stream = BtStream::server_handshake(stream, |req| {
             info!("Handshake request: for hash {}", req.hash);
-            let state = self.inner.state.lock().unwrap();
-            if !state.map.contains_key(&req.hash) {
+            if self.inner.controller.wait().has_metadata(req.hash) {
+                info!("Already have metadata for {}", req.hash);
                 return Err(BtError::HandshakeFailed);
             }
             let mut info = BtHandshakeInfo {
@@ -283,11 +290,13 @@ impl Downloader {
 
         // Save it
         self.done_job(hash);
-        self.inner.observer.on_metadata_downloaded(hash, torrent);
+        self.inner.controller.wait()
+            .on_metadata_downloaded(hash, torrent);
         return Ok(());
 
     }
 
+    /// Add a new peer to the downloader
     pub fn add_peer(&self, hash: InfoHash, ip: SocketAddr) {
         let mut state = self.inner.state.lock().unwrap();
         let inserted = state.map.entry(hash).or_insert(BTreeSet::new()).insert(ip);
@@ -299,5 +308,15 @@ impl Downloader {
         }
         // Start it
         self.inner.start_worker.send(hash).expect("It shouldn't fail");
+    }
+
+    /// Cancel a download
+    pub fn cancel(&self, hash: InfoHash) {
+        self.done_job(hash);
+    }
+
+    /// Set the controller
+    pub fn set_controller(&self, controller: Arc<dyn DownloaderController + Send + Sync>) {
+        let _ = self.inner.controller.set(controller);
     }
 }
