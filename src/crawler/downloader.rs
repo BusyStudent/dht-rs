@@ -32,7 +32,7 @@ struct DownloadState {
 struct DownloaderInner {
     state: Mutex<DownloadState>,
     start_worker: broadcast::Sender<InfoHash>,
-    controller: OnceLock<Arc<dyn DownloaderController + Sync + Send> >,
+    controller: OnceLock<Weak<dyn DownloaderController + Sync + Send> >,
     utp_context: UtpContext,
 }
 
@@ -171,8 +171,10 @@ impl Downloader {
 
             // Save it
             self.done_job(hash);
-            self.inner.controller.wait()
-                .on_metadata_downloaded(hash, torrent);
+
+            if let Some(controller) = self.inner.controller.wait().upgrade() {
+                controller.on_metadata_downloaded(hash, torrent);
+            }
             return;
         }
         info!("Downloading metadata for {} suspended, no more peers available", hash);
@@ -264,9 +266,16 @@ impl Downloader {
     }
 
     async fn handle_incoming(self, stream: UtpSocket) -> Result<(), BtError>{
-        let stream = BtStream::server_handshake(stream, |req| {
+        let controller = match self.inner.controller.wait().upgrade() {
+            Some(val) => val,
+            None => {
+                // We can't do anything without controller
+                return Err(BtError::UserDefined("Controller dropped".into()));
+            }
+        };
+        let stream = BtStream::server_handshake(stream, |req| async move {
             info!("Handshake request: for hash {}", req.hash);
-            if self.inner.controller.wait().has_metadata(req.hash) {
+            if controller.has_metadata(req.hash) {
                 info!("Already have metadata for {}", req.hash);
                 return Err(BtError::HandshakeFailed);
             }
@@ -290,14 +299,17 @@ impl Downloader {
 
         // Save it
         self.done_job(hash);
-        self.inner.controller.wait()
-            .on_metadata_downloaded(hash, torrent);
+        if let Some(controller) = self.inner.controller.wait().upgrade() {
+            controller.on_metadata_downloaded(hash, torrent);
+        }
         return Ok(());
 
     }
 
     /// Add a new peer to the downloader
     pub fn add_peer(&self, hash: InfoHash, ip: SocketAddr) {
+        debug_assert!(self.inner.controller.get().is_some(), "Controller should be set");
+
         let mut state = self.inner.state.lock().unwrap();
         let inserted = state.map.entry(hash).or_insert(BTreeSet::new()).insert(ip);
         if !inserted {
@@ -316,7 +328,7 @@ impl Downloader {
     }
 
     /// Set the controller
-    pub fn set_controller(&self, controller: Arc<dyn DownloaderController + Send + Sync>) {
+    pub fn set_controller(&self, controller: Weak<dyn DownloaderController + Send + Sync>) {
         let _ = self.inner.controller.set(controller);
     }
 }

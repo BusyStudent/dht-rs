@@ -332,7 +332,7 @@ impl App {
 
         let json = json!({
             "results": items,
-            "totalPages": info.total / MAX_SEARCH_PER_PAGES as u64,
+            "totalPages": (info.total as usize + MAX_SEARCH_PER_PAGES - 1) / MAX_SEARCH_PER_PAGES,
             "currentPage": search.page,
         });
         return Ok(json);

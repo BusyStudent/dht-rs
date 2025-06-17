@@ -4,7 +4,7 @@ use crate::{
     bt::*,
     crawler::{
         downloader::{Downloader, DownloaderController},
-        peer_finder::{PeerFinder, PeerFinderConfig},
+        peer_finder::{PeerFinder, PeerFinderConfig}, sampler::{Sampler, SamplerObserver},
     },
     dht::*,
     krpc::*,
@@ -17,6 +17,7 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex, MutexGuard},
 };
+use async_trait::async_trait;
 use tokio::{net::UdpSocket, sync::{Semaphore, mpsc}, task::JoinSet};
 use tracing::{error, info};
 
@@ -26,6 +27,7 @@ struct CrawlerInner {
     utp_context: UtpContext,
     downloader: Downloader,
     peer_finder: PeerFinder,
+    sampler: Sampler,
     observer: Arc<dyn CrawlerObserver + Send + Sync>,
 }
 
@@ -47,14 +49,11 @@ pub trait CrawlerObserver {
         return true;
     }
 
-    fn on_metadata_downloaded(&self, _info_hash: InfoHash, _data: Vec<u8>) {
-        //
-    }
+    /// Called when a metadata is downloaded
+    fn on_metadata_downloaded(&self, _info_hash: InfoHash, _data: Vec<u8>);
 
     /// Check did we has this metadata?
-    fn has_metadata(&self, _info_hash: InfoHash) -> bool {
-        return false;
-    }
+    fn has_metadata(&self, info_hash: InfoHash) -> bool;
 }
 
 impl Crawler {
@@ -62,7 +61,7 @@ impl Crawler {
         let udp = Arc::new(UdpSocket::bind(config.ip).await?);
         let krpc = KrpcContext::new(udp.clone());
         let utp = UtpContext::new(udp.clone());
-        let mut session = DhtSession::new(config.id, krpc);
+        let session = DhtSession::new(config.id, krpc);
 
         let finder_config = PeerFinderConfig {
             dht_session: session.clone(),
@@ -77,16 +76,10 @@ impl Crawler {
                 utp_context: utp.clone(),
                 downloader: Downloader::new(utp),
                 peer_finder: PeerFinder::new(finder_config),
+                sampler: Sampler::new(session.clone()),
                 observer: config.observer,
             }),
         };
-
-        // Set the callback of it
-        let weak = Arc::downgrade(&this.inner);
-        session.set_on_peer_announce(Box::new(move |info_hash, addr| match weak.upgrade() {
-            Some(this) => Crawler::on_peer_announce(this, info_hash, addr),
-            None => {}
-        }));
 
         let weak = Arc::downgrade(&this.inner);
         this.inner.peer_finder.set_callback(Box::new(move |info_hash, addr| match weak.upgrade() {
@@ -94,8 +87,17 @@ impl Crawler {
             None => {}
         }));
 
+        // Set the observer for dht session
+        let weak = Arc::downgrade(&this.inner);
+        this.inner.dht_session.set_observer(weak);
+
         // Set the controller
-        this.inner.downloader.set_controller(this.inner.clone());
+        let weak = Arc::downgrade(&this.inner);
+        this.inner.downloader.set_controller(weak);
+
+        // Set the observer for sampler
+        let weak = Arc::downgrade(&this.inner);
+        this.inner.sampler.set_observer(weak);
 
         return Ok(this);
     }
@@ -125,14 +127,6 @@ impl Crawler {
         }
     }
 
-    /// From dht session
-    fn on_peer_announce(inner: Arc<CrawlerInner>, info_hash: InfoHash, ip: SocketAddr) {
-        inner.observer.on_info_hash_found(info_hash);
-        if !inner.observer.has_metadata(info_hash) {
-            inner.downloader.add_peer(info_hash, ip);
-        }
-    }
-
     /// From peer finder
     fn on_peer_found(inner: Arc<CrawlerInner>, info_hash: InfoHash, ip: SocketAddr) {
         if !inner.observer.has_metadata(info_hash) {
@@ -154,10 +148,13 @@ impl Crawler {
         tokio::join!(
             self.process_udp(),           // The network loop
             self.inner.dht_session.run(), // The dht loop
-            self.inner.downloader.run()   // The download loop
+            self.inner.downloader.run(),  // The download loop
+            self.inner.sampler.run()      // The sampler loop
         );
     }
 }
+
+// TODO.. Delegate the weak to avoid memory leak
 
 // Delegate the downloader controller to the crawler
 impl DownloaderController for CrawlerInner {
@@ -168,5 +165,40 @@ impl DownloaderController for CrawlerInner {
 
     fn has_metadata(&self, info_hash: InfoHash) -> bool {
         return self.observer.has_metadata(info_hash);
+    }
+}
+
+#[async_trait]
+impl DhtSessionObserver for CrawlerInner {
+    /// From dht session
+    async fn on_peer_announce(&self, info_hash: InfoHash, ip: SocketAddr) {
+        if self.observer.has_metadata(info_hash) { // Already has the metadata
+            return;
+        }
+        if self.observer.on_info_hash_found(info_hash) {
+            // New, add to peer finder
+            self.peer_finder.add_hash(info_hash);
+        }
+        self.downloader.add_peer(info_hash, ip);
+    }
+
+    async fn on_query(&self, _: &[u8], ip: SocketAddr) {
+        // Try to sample it?
+        self.sampler.add_sample_node(ip);
+    }
+}
+
+#[async_trait]
+impl SamplerObserver for CrawlerInner {
+    async fn on_hash_sampled(&self, hashes: Vec<InfoHash>) {
+        for hash in hashes {
+            if self.has_metadata(hash) {
+                continue;
+            }
+            if self.observer.on_info_hash_found(hash) {
+                // New, add to peer finder
+                self.peer_finder.add_hash(hash);
+            }
+        }
     }
 }

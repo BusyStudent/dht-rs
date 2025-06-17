@@ -1,5 +1,6 @@
 #![allow(dead_code)] // Let it shutup!
 use std::collections::BTreeMap;
+use std::future::Future;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::io;
 use tracing::{trace, debug};
@@ -513,9 +514,13 @@ impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
     }
 
     /// Handshake like an server, and call the callback to get the handshake info
-    pub async fn server_handshake(mut stream: T, cb: impl FnOnce(&BtHandshakeRequest) -> Result<BtHandshakeInfo, BtError>) -> Result<BtStream<T> , BtError> {
+    /// 
+    /// `cb`: The async callback to get the handshake info, the result is Result<BtHandahakeInfo, BtError>
+    pub async fn server_handshake<F, Fut>(mut stream: T, cb: F) -> Result<BtStream<T> , BtError> 
+        where F: FnOnce(BtHandshakeRequest) -> Fut, Fut: Future<Output = Result<BtHandshakeInfo, BtError> >
+    {
         let request = utils::read_handshake(&mut stream).await?;
-        let info = cb(&request)?;
+        let info = cb(request.clone()).await?;
         return BtStream::build(stream, request, info).await;
     }
 

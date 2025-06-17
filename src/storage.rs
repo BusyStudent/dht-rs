@@ -123,7 +123,7 @@ impl Storage {
         let mut torrents = Vec::new();
         let mut total = 0;
 
-        let mut first_row = false;
+        let mut first_row = true;
         while let Some(row) = rows.next()? {
             if first_row {
                 total = row.get(4)?;

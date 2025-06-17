@@ -2,11 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, HashMap};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
-use tokio::task::JoinSet;
+use tokio::{task::JoinSet, sync::RwLock};
 use tracing::{debug, error, info, trace, warn};
 use thiserror::Error;
+use async_trait::async_trait;
 
 use crate::{NodeId, dht::RoutingTable};
 use crate::krpc::*;
@@ -20,21 +21,25 @@ const MAX_ITERATIONS: usize = 16; // The max iterations of the find_node / get_p
 const MAX_ALPHA: usize = 10; // Use more cocorrent requests, to speed up the process
 const MAX_PEERS: usize = 100; // The max peers we can get from the get_peers
 
-type OnPeerAnnounceCallback = Box<dyn Fn(InfoHash, SocketAddr) + Send>;
-
 struct DhtSessionInner {
     routing_table: Mutex<RoutingTable>,
-    peers: Mutex<BTreeMap<InfoHash, BTreeSet<SocketAddr> > >, // The peers we know about, indexed by infohash
+    peers: RwLock<BTreeMap<InfoHash, BTreeSet<SocketAddr> > >, // The peers we know about, indexed by infohash
     krpc: KrpcContext,
     id: NodeId, // The self id
     ipv4: bool, // does it run on ipv4? ,false on ipv6
     timeout: Duration, // The timeout for the all krpc requests
-    on_peer_announce: Mutex<Option<OnPeerAnnounceCallback> >  // The callback on the peer announced
+    observer: OnceLock<Weak<dyn DhtSessionObserver + Sync + Send> >
 }
 
 #[derive(Clone)]
 pub struct DhtSession {
     inner: Arc<DhtSessionInner>
+}
+
+#[async_trait]
+pub trait DhtSessionObserver {
+    async fn on_peer_announce(&self, hash: InfoHash, addr: SocketAddr);
+    async fn on_query(&self, method: &[u8], addr: SocketAddr);
 }
 
 /// The Error from the find_node
@@ -111,12 +116,12 @@ impl DhtSession {
             inner: Arc::new(
                 DhtSessionInner {
                     routing_table: Mutex::new(RoutingTable::new(id)),
-                    peers: Mutex::new(BTreeMap::new()),
+                    peers: RwLock::new(BTreeMap::new()),
                     krpc: krpc,
                     id: id,
                     ipv4: ipv4,
                     timeout: KRPC_TIMEOUT_DRUATION,
-                    on_peer_announce: Mutex::new(None),
+                    observer: OnceLock::new(),
                 }
             )
         };
@@ -482,7 +487,7 @@ impl DhtSession {
                 // Find the infohash in the routing table and collect the peers if exists
                 let mut values = Vec::new();
                 let nodes = self.routing_table_mut().find_node(query.info_hash);
-                if let Some(peers) = self.inner.peers.lock().expect("Mutex poisoned").get(&query.info_hash) {
+                if let Some(peers) = self.inner.peers.read().await.get(&query.info_hash) {
                     for peer in peers {
                         values.push(peer.clone());
                     }
@@ -525,7 +530,7 @@ impl DhtSession {
 
                 // Add the peer to the routing table
                 {
-                    let mut set = self.inner.peers.lock().expect("Mutex poisoned");
+                    let mut set = self.inner.peers.write().await;
                     set.entry(query.info_hash).or_default().insert(peer_ip);
                 } // Avoid the lock across the await point
                 let reply = AnnouncePeerReply {
@@ -533,12 +538,9 @@ impl DhtSession {
                 };
                 let _ = self.inner.krpc.send_reply(tid, reply, ip).await;
 
-                // Check if we have callback, and than invoke it
-                {
-                    let opt = self.inner.on_peer_announce.lock().expect("Mutex poisoned");
-                    if let Some(cb) = opt.as_ref() {
-                        cb(query.info_hash, peer_ip);
-                    }
+                // Notify the observer if exists
+                if let Some(observer) = self.inner.observer.get().and_then(|o| o.upgrade()) {
+                    observer.on_peer_announce(query.info_hash, peer_ip).await;                        
                 }
 
                 query.id
@@ -555,12 +557,17 @@ impl DhtSession {
         };
         trace!("Received query method {} from {}: {} ", String::from_utf8_lossy(method), id, ip);
         let _ = self.routing_table_mut().update_node(id, ip);
+
+        // Notify the observer if exists
+        if let Some(observer) = self.inner.observer.get().and_then(|o| o.upgrade()) {
+            observer.on_query(method, ip.clone()).await;
+        }
         return true;
     }
 
-    /// Set the callback handler for peer announce
-    pub fn set_on_peer_announce(&mut self, cb : OnPeerAnnounceCallback) {
-        self.inner.on_peer_announce.lock().expect("Mutex poisoned").replace(cb);
+    /// Set the observer, NOTE: it only can set once
+    pub fn set_observer(&self, observer: Weak<dyn DhtSessionObserver + Sync + Send>) {
+        let _ = self.inner.observer.set(observer);
     }
 
     async fn bootstrap(&self) -> bool {
@@ -655,7 +662,7 @@ impl DhtSession {
     async fn clear_peers(&self) {
         loop {
             tokio::time::sleep(MIN_CLEAR_INTERVAL).await;
-            self.inner.peers.lock().expect("Mutex poisoned").clear();
+            self.inner.peers.write().await.clear();
             debug!("Clear the peers we have");
         }
     }

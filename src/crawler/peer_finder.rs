@@ -79,7 +79,7 @@ impl PeerFinder {
         for _ in 0..self.inner.max_retries {
             let premit = match self.inner.sem.acquire().await {
                 Ok(p) => p,
-                Err(_) => return, // Too many tasks are running, abort
+                Err(_) => return, // May not happend
             };
             info!("Finding peers for {}", hash);
             if let Ok(result) = self.inner.dht_session.clone().get_peers(hash).await {
