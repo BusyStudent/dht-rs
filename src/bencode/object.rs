@@ -1,6 +1,6 @@
-use std::{collections::BTreeMap};
+use std::{collections::BTreeMap, fmt};
 
-#[derive(PartialEq, Eq, Debug, Clone)]
+#[derive(PartialEq, Eq, Clone)]
 pub enum Object {
     Int(i64),
     String(Vec<u8>),
@@ -92,7 +92,7 @@ impl Object {
         return self.as_dict()?.get(key);
     }
 
-    /// Parse any bencoded input
+    /// Parse any bencoded input, raw version
     pub fn decode(bytes: &[u8]) -> Option<(Object, &[u8])> {
         return match bytes.first()? {
             b'0'..=b'9' => Object::decode_string(bytes),
@@ -101,6 +101,12 @@ impl Object {
             b'd' => Object::decode_dict(bytes),
             _ => None,
         }
+    }
+
+    /// Parse any bencoded input, return the object version
+    pub fn parse(bytes: &[u8]) -> Option<Object> {
+        let (obj, _) = Object::decode(bytes)?;
+        return Some(obj);
     }
 
     /// Parse int, input like i11e
@@ -185,19 +191,19 @@ impl Object {
                 out.push(b'i');
                 out.extend_from_slice(i.to_string().as_bytes());
                 out.push(b'e');
-            },
+            }
             Object::String(s) => { // 4:spam
                 out.extend_from_slice(s.len().to_string().as_bytes());
                 out.push(b':');
                 out.extend_from_slice(s.as_slice());
-            },
+            }
             Object::List(list) => { // lxxxe
                 out.push(b'l');
                 for each in list {
                     each.encode_to(out);
                 }
                 out.push(b'e');
-            },
+            }
             Object::Dict(dict) => { // dxxxe
                 out.push(b'd');
                 for (key, value) in dict {
@@ -209,7 +215,7 @@ impl Object {
                     value.encode_to(out);
                 }
                 out.push(b'e');
-            },
+            }
         }
     }
 }
@@ -269,6 +275,57 @@ impl<const N: usize> From<[(Vec<u8>, Object); N]> for Object {
     /// Create an dict object from the array of key and value
     fn from(arr: [(Vec<u8>, Object); N]) -> Self {
         return Object::Dict(BTreeMap::from(arr));
+    }
+}
+
+/// Format like human readable json
+impl fmt::Debug for Object {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let write_string = |f: &mut fmt::Formatter<'_>, s: &[u8]| {
+            if let Ok(utf8) = std::str::from_utf8(s) { // Valid utf8
+                return write!(f, "\"{}\"", utf8);
+            }
+            // not valid u8, print like \x01\x02\x03
+            for each in s.iter() {
+                write!(f, "\\x{:02x}", each)?;
+            }
+            return Ok(());
+        };
+
+        return match self {
+            Object::Int(i) => {
+                write!(f, "{}", i)
+            }
+            Object::String(s) => {
+                write_string(f, &s)
+            }
+            Object::List(list) => {
+                write!(f, "[")?;
+                for (i, each) in list.iter().enumerate() {
+                    write!(f, "{:?}", each)?;
+                    if i != list.len() - 1 {
+                        write!(f, ", ")?;
+                    }
+                }
+                write!(f, "]")?;
+
+                Ok(())
+            }
+            Object::Dict(dict) => {
+                write!(f, "{{")?;
+                for (i, (key, value)) in dict.iter().enumerate() {
+                    write_string(f, &key)?;
+                    write!(f, ": ")?;
+                    write!(f, "{:?}", value)?;
+                    if i != dict.len() - 1 {
+                        write!(f, ", ")?;
+                    }
+                }
+                write!(f, "}}")?;
+
+                Ok(())
+            }
+        }
     }
 }
 

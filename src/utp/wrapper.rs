@@ -319,6 +319,7 @@ impl UtpSocket {
 impl UtpSocketInner {
     fn on_state_change(&self, state: UTP_STATE) {
         let mut this = self.state.lock().unwrap();
+        info!("UtpSocket {:?} state changed to {:?}", self.utp_socket, state);
         match state {
             UTP_STATE::WRITABLE | UTP_STATE::CONNECT => {
                 // On connect or writeable, we can write
@@ -345,6 +346,7 @@ impl UtpSocketInner {
     }
 
     fn on_error(&self, error: UTP_ERROR) {
+        info!("UtpSocket {:?} into error, code: {:?}", self.utp_socket, error);
         let mut this = self.state.lock().unwrap();
         this.error_code = Some(error);
 
@@ -358,6 +360,7 @@ impl UtpSocketInner {
     }
 
     fn on_read(&self, data: &[u8]) {
+        info!("UtpSocket {:?} into readable, {} bytes can read", self.utp_socket, data.len());
         let mut this = self.state.lock().unwrap();
         this.read_buf.extend(data);
 
@@ -416,6 +419,8 @@ impl AsyncRead for UtpSocket {
 
             let total = len1 + len2;
             this.read_buf.drain(..total);
+
+            info!("UtpSocket {:?} read {} bytes {} bytes left", self.inner.utp_socket, total, this.read_buf.len());
             return Poll::Ready(Ok(()));
         }
         if this.eof {
@@ -423,6 +428,7 @@ impl AsyncRead for UtpSocket {
         }
 
         // Save until we have data
+        info!("UtpSocket {:?} now is not readable, waiting for data", self.inner.utp_socket);
         this.read_waker = Some(cx.waker().clone());
         return Poll::Pending;
     }
@@ -464,6 +470,7 @@ impl AsyncWrite for UtpSocket {
         }
 
         // No longer writable we need to suspend self
+        info!("UtpSocket {:?} now is not writable, waiting for writable", self.inner.utp_socket);
         this.write_waker = Some(cx.waker().clone());
         return Poll::Pending;
     }

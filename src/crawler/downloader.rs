@@ -22,7 +22,12 @@ use tokio::sync::broadcast;
 use tracing::{error, info};
 
 const MAX_WORKERS: usize = 5;
-const MAX_DOWNLOAD_TIME: Duration = Duration::from_secs(60 * 2);
+const MAX_CONCURRENT: usize = 10; // Max concurrent downloading for pre each worker
+const MAX_DOWNLOAD_TIME: Duration = Duration::from_secs(60);
+
+struct WorkerState {
+    
+}
 
 struct DownloadState {
     map: BTreeMap<InfoHash, BTreeSet<SocketAddr> >, // Mapping info hash to the list of peers
@@ -182,6 +187,7 @@ impl Downloader {
 
     // Do the attually download for given stream and hash
     async fn do_download<T: AsyncRead + AsyncWrite + Unpin>(mut stream: BtStream<T>, hash: InfoHash) -> Result<Vec<u8>, BtError> {
+        info!("Peer extension info: {:?}", stream.peer_info().extensions);
         let metadata_id = stream
             .peer_info()
             .metadata_id()
@@ -210,6 +216,7 @@ impl Downloader {
                     BtMessage::Extended { id, msg, payload } => (id, msg, payload),
                     _ => continue,
                 };
+                info!("Ext message from peer: {id:?} {msg:?}");
                 if id != local_metadata_id {
                     warn!("Unexpected message id {id}");
                     continue; // Ignore

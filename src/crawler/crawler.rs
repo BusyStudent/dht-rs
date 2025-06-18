@@ -15,7 +15,7 @@ use std::{
     collections::BTreeSet,
     io,
     net::SocketAddr,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, MutexGuard},
 };
 use async_trait::async_trait;
 use tokio::{net::UdpSocket, sync::{Semaphore, mpsc}, task::JoinSet};
@@ -29,6 +29,8 @@ struct CrawlerInner {
     peer_finder: PeerFinder,
     sampler: Sampler,
     observer: Arc<dyn CrawlerObserver + Send + Sync>,
+
+    auto_sample: AtomicBool,
 }
 
 /// The cralwer is responsible for collect info hash and download metadata
@@ -78,6 +80,8 @@ impl Crawler {
                 peer_finder: PeerFinder::new(finder_config),
                 sampler: Sampler::new(session.clone()),
                 observer: config.observer,
+
+                auto_sample: AtomicBool::new(false),
             }),
         };
 
@@ -139,8 +143,14 @@ impl Crawler {
         return &self.inner.dht_session;
     }
     
+    /// Add a info hash to the crawler, let the crawler find the peers and download the metadata
     pub fn add_hash(&self, info_hash: InfoHash) {
         return self.inner.peer_finder.add_hash(info_hash);
+    }
+
+    /// Enable or disable the auto sample
+    pub fn set_auto_sample(&self, enable: bool) {
+        self.inner.auto_sample.store(enable, Ordering::Relaxed);
     }
 
     /// Start the crawler
@@ -184,7 +194,9 @@ impl DhtSessionObserver for CrawlerInner {
 
     async fn on_query(&self, _: &[u8], ip: SocketAddr) {
         // Try to sample it?
-        self.sampler.add_sample_node(ip);
+        if self.auto_sample.load(Ordering::Relaxed) {
+            self.sampler.add_sample_node(ip);
+        }
     }
 }
 

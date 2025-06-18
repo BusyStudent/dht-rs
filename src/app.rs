@@ -1,19 +1,16 @@
 #![allow(dead_code)] // Let it shutup!
 use serde::{Deserialize, Serialize};
+use tokio_stream::Stream;
 use std::{
-    collections::{BTreeSet}, 
-    fs, 
-    io::{Write}, 
-    net::SocketAddr, 
-    sync::{Arc, Mutex, MutexGuard}
+    collections::BTreeSet, convert::Infallible, fs, io::Write, net::SocketAddr, sync::{Arc, Mutex, MutexGuard}, time::Duration
 };
 use tokio::{
-    net, task::JoinHandle
+    net, task::JoinHandle, sync::broadcast,
 };
 use axum::{
     Router, 
     routing::{get, post}, 
-    response::{Html, IntoResponse, Json},
+    response::{Html, IntoResponse, Json, sse::{Sse, Event, KeepAlive}},
     extract::{State, Path},
     extract,
 };
@@ -62,6 +59,7 @@ struct AppInner {
     crawler: Mutex<Option<(Crawler, JoinHandle<()>)> >, // The cralwer and its task handle
     info_hashes: Mutex<BTreeSet<InfoHash> >,
     storage: Storage, // The database 
+    broadcast: broadcast::Sender<Option<String> >, // Push the events to the webui, none on shutdown
 }
 
 #[derive(Clone)]
@@ -82,7 +80,8 @@ impl CrawlerObserver for AppInner {
             if self.has_metadata(hash) {
                 return false; // Already exists
             }
-            info!("Found a new info hash: {}", hash);
+            info!("Found a new info hash: {}", hash); // On Console!
+            let _ = self.broadcast.send(Some(format!("Found a new info hash: {}", hash))); // On WebUI!
         }
         return is_new;
     }
@@ -93,6 +92,7 @@ impl CrawlerObserver for AppInner {
 
     fn on_metadata_downloaded(&self, _hash: InfoHash, data: Vec<u8>) {
         let torrent = Torrent::from_info_bytes(&data).expect("It should never failed");
+        let _ = self.broadcast.send(Some(format!("Downloaded a new torrent: {}", torrent.name()))); // On WebUI!
         let _ = self.storage.add_torrent(&torrent);
     }
 }
@@ -119,6 +119,7 @@ impl App {
                 }
             },
         };
+        let (sx, _) = broadcast::channel(100);
         
         return App {
             inner: Arc::new(
@@ -127,6 +128,7 @@ impl App {
                     crawler: Mutex::new(None),
                     info_hashes: Mutex::new(BTreeSet::new()),
                     storage: Storage::open("./data/torrents.db").expect("Can not open the storage database"),
+                    broadcast: sx,
                 }
             )
         };
@@ -142,6 +144,9 @@ impl App {
             .route("/api/v1/start_dht", get(App::start_dht_handler))
             .route("/api/v1/stop_dht", get(App::stop_dht_handler))
             .route("/api/v1/is_dht_running", get(App::is_dht_running_handler))
+
+            // SSE
+            .route("/api/v1/sse/events", get(App::sse_events_handler))
             
             // Info Query
             .route("/api/v1/get_routing_table", get(App::get_routing_table_handler))
@@ -187,6 +192,7 @@ impl App {
 
         // Shutdown the DHT if it's running
         self.stop_dht().await;
+        let _ = self.inner.broadcast.send(None);
     }
 
     // Stop the DHT
@@ -444,6 +450,30 @@ impl App {
                 "error" : err 
             })),
         }
+
+    }
+
+    // SSE
+    async fn sse_events_handler(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, Infallible> > > {
+        let mut rx = app.inner.broadcast.subscribe();
+        let stream = async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(Some(msg)) => {
+                        yield Ok(Event::default().data(&msg));
+                    }
+                    Ok(None) => {
+                        return; // We are shutting down
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+        };
+
+        return Sse::new(stream)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)));
 
     }
 }

@@ -4,7 +4,7 @@ use std::{collections::{HashMap}, net::SocketAddr, sync::{Arc, Mutex, OnceLock, 
 
 use tokio::{sync::Semaphore};
 use async_trait::async_trait;
-use tracing::{info, warn};
+// use tracing::{info};
 
 use crate::{dht::DhtSession, InfoHash, NodeId};
 
@@ -58,7 +58,7 @@ impl Sampler {
                 }
             }
         }
-        info!("Sampling {ip}");
+        // info!("Sampling {ip}");
         sampled.insert(ip, None); // We are going to sample this node
 
         // Start it
@@ -82,14 +82,14 @@ impl Sampler {
 
         let (hashes, duration) = match result {
             Ok(reply) => {
-                info!("Sampled {} infohashes from {ip}", reply.info_hashes.len());
+                // info!("Sampled {} infohashes from {ip}", reply.info_hashes.len());
                 let hashes = reply.info_hashes;
                 let dur = Duration::from_secs(reply.interval as u64);
                 
                 (hashes, dur)
             }
-            Err(err) => {
-                warn!("Failed to sample infohashes from {ip}: {err}");
+            Err(_err) => {
+                // warn!("Failed to sample infohashes from {ip}: {err}");
 
                 (Vec::new(), Duration::from_secs(60 * 60)) // 1 hour latency for retries if we fail
             }
@@ -109,5 +109,10 @@ impl Sampler {
 
     pub async fn run(&self) {
         // TODO:
+        loop {
+            tokio::time::sleep(Duration::from_secs(60 * 60 * 2)).await; // 2 hours clean up
+            let mut sampled = self.inner.sampled.lock().unwrap();
+            sampled.clear();
+        }
     }
 }

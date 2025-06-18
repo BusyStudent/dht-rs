@@ -343,7 +343,7 @@ impl DhtSession {
             else {
                 iteration_with_convergence += 1;
                 if iteration_with_convergence >= NUM_QUERIES_PER_ITERATION * MAX_ITERATIONS_WITH_CONVERGENCE {
-                    debug!("Convergence reached, stopping the search.");
+                    trace!("Convergence reached, stopping the search.");
                     break; // We have convergence, stop the search
                 }
             }
@@ -352,7 +352,7 @@ impl DhtSession {
             queue.truncate(8 * 8);
             collected.truncate(8 * 8);
 
-            warn!("get_peers: queries_completed {queries_completed}, iteration_with_convergence {iteration_with_convergence}");
+            trace!("get_peers: queries_completed {queries_completed}, iteration_with_convergence {iteration_with_convergence}");
         }
 
         // Done
