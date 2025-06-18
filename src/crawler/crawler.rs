@@ -65,10 +65,23 @@ impl Crawler {
         let utp = UtpContext::new(udp.clone());
         let session = DhtSession::new(config.id, krpc);
 
+        // The peerid, begin 2 bytes is for client, we use DI (DHT Indexer), then 4 bytes for version, then 12 bytes for random bytes.
+        let mut id = [0u8; 20];
+        id[0] = b'D';
+        id[1] = b'I';
+        id[2] = b'0';
+        id[3] = b'0';
+        id[4] = b'0';
+        id[5] = b'1'; // Version 1
+        for b in id[6..].iter_mut() {
+            *b = fastrand::u8(..);
+        }
+        let id = PeerId::from(id);
+
         let finder_config = PeerFinderConfig {
             dht_session: session.clone(),
-            max_concurrent: 5,
-            max_retries: 3,
+            max_concurrent: 20, // 5 may be too small, use 20?
+            max_retries: 2,
         };
 
         let this = Crawler {
@@ -76,12 +89,12 @@ impl Crawler {
                 udp: udp,
                 dht_session: session.clone(),
                 utp_context: utp.clone(),
-                downloader: Downloader::new(utp),
+                downloader: Downloader::new(utp, id),
                 peer_finder: PeerFinder::new(finder_config),
                 sampler: Sampler::new(session.clone()),
                 observer: config.observer,
 
-                auto_sample: AtomicBool::new(false),
+                auto_sample: AtomicBool::new(true),
             }),
         };
 

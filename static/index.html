@@ -553,8 +553,8 @@
                 const action = button.dataset.action;
                 const hash = button.dataset.hash;
                 
-                if (action === 'copy-hash') {
-                    navigator.clipboard.writeText(hash).then(() => alert(`Info Hash 已复制: ${hash}`));
+                if (action === 'download-torrent') {
+                    window.open(`/api/v1/torrents/${hash}`, '_blank');
                 } else if (action === 'copy-magnet') {
                     const magnet = `magnet:?xt=urn:btih:${hash}`;
                     navigator.clipboard.writeText(magnet).then(() => alert(`磁力链接已复制: ${magnet}`));
@@ -727,7 +727,7 @@
             return;
         }
 
-        resultsContainer.innerHTML = '<p>正在搜索, 请稍候...</p>';
+        // resultsContainer.innerHTML = '<p>正在搜索, 请稍候...</p>';
         renderPaginationControls(0, 0); // 清空旧的翻页
 
         try {
@@ -866,7 +866,7 @@
                         <h4>${item.name}</h4>
                         <p class="info-hash">Hash: ${item.info_hash}</p>
                         <div class="actions">
-                            <button class="button" data-action="copy-hash" data-hash="${item.info_hash}">复制Hash</button>
+                            <button class="button" data-action="download-torrent" data-hash="${item.info_hash}">下载种子</button>
                             <button class="button" data-action="copy-magnet" data-hash="${item.info_hash}">复制磁力</button>
                             <button class="button" data-action="toggle-files">查看文件</button>
                         </div>
@@ -879,7 +879,7 @@
                         <h4>元数据待获取</h4>
                         <p class="info-hash">Hash: ${item.info_hash}</p>
                         <div class="actions">
-                            <button class="button" data-action="copy-hash" data-hash="${item.info_hash}">复制Hash</button>
+                            <button class="button" data-action="download-torrent" data-hash="${item.info_hash}">下载种子</button>
                             <button class="button" data-action="copy-magnet" data-hash="${item.info_hash}">复制磁力</button>
                         </div>
                     </div>

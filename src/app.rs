@@ -1,18 +1,23 @@
-#![allow(dead_code)] // Let it shutup!
 use serde::{Deserialize, Serialize};
 use tokio_stream::Stream;
 use std::{
-    collections::BTreeSet, convert::Infallible, fs, io::Write, net::SocketAddr, sync::{Arc, Mutex, MutexGuard}, time::Duration
+    collections::BTreeSet, 
+    convert::Infallible, 
+    fs, 
+    io::Write, 
+    net::SocketAddr, 
+    sync::{Arc, Mutex, MutexGuard}, 
+    time::Duration
 };
 use tokio::{
     net, task::JoinHandle, sync::broadcast,
 };
 use axum::{
-    Router, 
+    extract::{self, Path, State}, 
+    http::{HeaderMap, StatusCode}, 
+    response::{sse::{Event, KeepAlive, Sse}, Html, IntoResponse, Json}, 
     routing::{get, post}, 
-    response::{Html, IntoResponse, Json, sse::{Sse, Event, KeepAlive}},
-    extract::{State, Path},
-    extract,
+    Router
 };
 
 use serde_json::{
@@ -57,7 +62,7 @@ struct Metadata {
 struct AppInner {
     config: Mutex<Config>,
     crawler: Mutex<Option<(Crawler, JoinHandle<()>)> >, // The cralwer and its task handle
-    info_hashes: Mutex<BTreeSet<InfoHash> >,
+    info_hashes: Mutex<BTreeSet<InfoHash> >, // The info hashes that we have found, TODO: use LRU cache
     storage: Storage, // The database 
     broadcast: broadcast::Sender<Option<String> >, // Push the events to the webui, none on shutdown
 }
@@ -71,17 +76,19 @@ fn default_ip() -> String {
     return "127.0.0.1".into();
 }
 
-const MAX_SEARCH_PER_PAGES: usize = 50;
+const MAX_SEARCH_PER_PAGES: usize = 25;
 
 impl CrawlerObserver for AppInner {
     fn on_info_hash_found(&self, hash: InfoHash) -> bool {
-        let is_new = self.info_hashes.lock().unwrap().insert(hash);
+        let mut map = self.info_hashes.lock().unwrap();
+        let is_new = map.insert(hash);
         if is_new { // Check exist in the filesystem?
             if self.has_metadata(hash) {
                 return false; // Already exists
             }
             info!("Found a new info hash: {}", hash); // On Console!
-            let _ = self.broadcast.send(Some(format!("Found a new info hash: {}", hash))); // On WebUI!
+            let msg = format!("Found a new info hash: {}, {} in total", hash, map.len());
+            let _ = self.broadcast.send(Some(msg)); // On WebUI!
         }
         return is_new;
     }
@@ -156,6 +163,7 @@ impl App {
 
             // Search
             .route("/api/v1/search_metadata", post(App::search_metadata_handler))
+            .route("/api/v1/torrents/{*info_hash}", get(App::get_torrent_handler))
 
             // Config...
             .route("/api/v1/get_config", get(App::get_config_handler))
@@ -351,6 +359,23 @@ impl App {
                 "error": format!("Error to search metadata ({err})")
             })),
         }
+    }
+
+    async fn get_torrent_handler(State(app): State<App>, Path(hash): Path<String>) -> impl IntoResponse {
+        let torrent = match InfoHash::from_hex(&hash) {
+            None => return Err(StatusCode::BAD_REQUEST),
+            Some(hash) => {
+                app.inner.storage.get_torrent(hash).ok()
+            }
+        };
+        // Build the reply
+        if let Some(data) = torrent {
+            let mut header = HeaderMap::new();
+            header.insert("Content-Type", "application/octet-stream".parse().unwrap());
+
+            return Ok((header, data));
+        }
+        return Err(StatusCode::NOT_FOUND);
     }
 
     // Tools

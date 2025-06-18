@@ -1,48 +1,42 @@
-#![allow(dead_code, unused_imports)] // Let it shutup!
+#![allow(dead_code)] // Let it shutup!
 
-use crate::utp::*;
-use crate::bt::*;
+use crate::utp::{UtpContext, UtpSocket, UtpListener};
+use crate::bt::{BtStream, BtHandshakeInfo, BtMessage, BtError, PeerId, UtMetadataMessage};
 use crate::InfoHash;
+use crate::bencode::Object;
 use sha1::Digest;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
-use tokio::join;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::Semaphore;
+use tokio::task::AbortHandle;
 use tokio::task::JoinSet;
 use tracing::warn;
+use std::collections::HashMap;
 use std::{
-    collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     sync::{Arc, Mutex, Weak, OnceLock},
     time::Duration,
-    io
 };
-use tokio::net;
-use tokio::sync::broadcast;
+use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
-const MAX_WORKERS: usize = 5;
+const MAX_WORKERS: usize = 10;
 const MAX_CONCURRENT: usize = 10; // Max concurrent downloading for pre each worker
+const MAX_PENDING_PEERS: usize = 30;
 const MAX_DOWNLOAD_TIME: Duration = Duration::from_secs(60);
 
-struct WorkerState {
-    
-}
-
-struct DownloadState {
-    map: BTreeMap<InfoHash, BTreeSet<SocketAddr> >, // Mapping info hash to the list of peers
-    workers: BTreeSet<InfoHash>,                    // Mapping the workers of currently downloading
-}
-
 struct DownloaderInner {
-    state: Mutex<DownloadState>,
-    start_worker: broadcast::Sender<InfoHash>,
+    workers: Mutex<HashMap<InfoHash, (AbortHandle, mpsc::Sender<SocketAddr>) > >, // Mapping info hash to the workers
     controller: OnceLock<Weak<dyn DownloaderController + Sync + Send> >,
+    sem: Semaphore, // For limit max running workers
+    cancel_watch: OnceLock<watch::Receiver<bool> >,
     utp_context: UtpContext,
+    peer_id: PeerId,
 }
 
 // pub struct DownloaderConfig {
-//     controller: Arc<dyn CrawlerObserver + Sync + Send>,
 //     utp_context: UtpContext,
 //     peer_id: PeerId,
 // }
@@ -58,54 +52,42 @@ pub struct Downloader {
     inner: Arc<DownloaderInner>,
 }
 
+struct CancelGuard {
+    sender: watch::Sender<bool>
+}
+
 impl Downloader {
     // Create an downloader
-    pub fn new(ctxt: UtpContext) -> Downloader {
-        let (sx, _rx) = broadcast::channel(114514);
-        let downloader = Downloader {
-            inner: Arc::new(DownloaderInner {
-                state: Mutex::new(
-                    DownloadState {
-                        map: BTreeMap::new(),
-                        workers: BTreeSet::new(),
-                    }
-                ),
-                start_worker: sx.clone(),
-                controller: OnceLock::new(),
-                utp_context: ctxt,
-            }),
-        };
+    pub fn new(ctxt: UtpContext, id: PeerId) -> Self {
+        let downloader = Self { inner: Arc::new(DownloaderInner {
+            workers: Mutex::new(HashMap::new()),
+            controller: OnceLock::new(),
+            sem: Semaphore::new(MAX_WORKERS),
+            cancel_watch: OnceLock::new(),
+            utp_context: ctxt,
+            peer_id: id,
+        })};
         return downloader;
     }
 
-    /// Run the workers of downloader
+    /// Run the downloader, guard for the cancel signal
     pub async fn run(&self) {
-        let mut set = JoinSet::new();
-        for _ in 0..MAX_WORKERS {
-            set.spawn(self.clone().worker_main());
-        }
-        let _ = tokio::join!(set.join_all(), self.listener_main());
+        let (sx, rx) = watch::channel(false);
+        let _guard = CancelGuard { sender: sx };
+        self.inner.cancel_watch.set(rx).unwrap(); // Set the cancel watch for the worker
+
+        // Begin Listen
+        self.listener_main().await;
     }
 
-    // Pulling the job from the queue
-    async fn worker_main(self) {
-        let mut rx = self.inner.start_worker.subscribe();
-        loop {
-            let hash = match rx.recv().await {
-                Ok(hash) => hash,
-                Err(_) => break,
-            }; // We Got an new task
-            {
-                let mut locked = self.inner.state.lock().unwrap();
-                if !locked.workers.insert(hash) {
-                    continue; // Already has a worker do it
-                }
-            }
-            self.download_for(hash).await;
-            {
-                let mut locked = self.inner.state.lock().unwrap();
-                locked.workers.remove(&hash); // We finished all the work
-            }
+    fn make_handshake_info(&self, hash: InfoHash) -> BtHandshakeInfo {
+        return BtHandshakeInfo {
+            hash: hash,
+            peer_id: self.inner.peer_id.clone(),
+            extensions: Some(Object::from([
+                (b"m".to_vec(), Object::from([(b"ut_metadata".to_vec(), Object::from(1))])),
+                (b"v".to_vec(), Object::from(b"DHT Indexer"))
+            ]))
         }
     }
 
@@ -125,64 +107,50 @@ impl Downloader {
         }
     }
 
-    // Downloading the metadata
-    fn get_peer(&self, hash: InfoHash) -> Option<SocketAddr> {
-        let locked = self.inner.state.lock().unwrap();
-        let peers = locked.map.get(&hash)?;
-        return Some(peers.first()?.clone());
-    }
-
-    fn clear_peer(&self, hash: InfoHash, ip: SocketAddr) -> Option<()> {
-        let mut locked = self.inner.state.lock().unwrap();
-        let peers = locked.map.get_mut(&hash)?;
-        peers.remove(&ip);
-        return Some(());
-    }
-
-    fn done_job(&self, hash: InfoHash) {
-        let mut locked = self.inner.state.lock().unwrap();
-        locked.map.remove(&hash);
-    }
-
-    async fn download_for(&self, hash: InfoHash) {
-        info!("Downloading metadata for {}", hash);
-        while let Some(peer) = self.get_peer(hash) {
-            let res = tokio::time::timeout(
-                MAX_DOWNLOAD_TIME, 
-                self.download(hash, peer)
-            ).await;
-            // Flattern the result..., translate the timeout error
-            let res = match res {
-                Ok(val) => val,
-                Err(_) => {
-                    let io_error = io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "It take too loong to download the meatadata"
-                    );
-                    Err(BtError::NetworkError(io_error))
+    // Pulling the job from the queue
+    async fn worker_main(&self, hash: InfoHash, mut receiver: mpsc::Receiver<SocketAddr>) {
+        let _premit = match self.inner.sem.acquire().await {
+            Ok(val) => val,
+            Err(_) => return,
+        };
+        let mut set = JoinSet::new();
+        let mut once_empty = false; // Once empty, we can exit
+        loop {
+            // Try recv until reach the max concurrent and start more task
+            while set.len() < MAX_CONCURRENT {
+                match receiver.try_recv() {
+                    Ok(peer) => {
+                        let task = self.clone().download(hash, peer);
+                        let task = tokio::time::timeout(MAX_DOWNLOAD_TIME, task); // Add an timeout
+                        once_empty = false;
+                        set.spawn(task);
+                    },
+                    Err(_) => break,
                 }
-            };
-            // Handle it
-            let torrent = match res {
-                Ok(torrent) => torrent,
-                Err(e) => {
-                    info!("Failed to download metadata from {}: {}", peer, e);
-                    self.clear_peer( hash, peer);
-                    continue;
-                }
-            };
-            info!("Downloaded metadata hash {} from {}", hash, peer);
-
-
-            // Save it
-            self.done_job(hash);
-
-            if let Some(controller) = self.inner.controller.wait().upgrade() {
-                controller.on_metadata_downloaded(hash, torrent);
             }
-            return;
+            let compelete = match set.join_next().await {
+                Some(val) => val.expect("The task could not be canceled"),
+                None => {
+                    if once_empty { // No more job, exit
+                        break;
+                    }
+                    once_empty = true;
+                    tokio::time::sleep(Duration::from_millis(100)).await; // Wait for a while
+                    continue;
+                },
+            };
+            let compelete = match compelete {
+                Ok(val) => val,
+                Err(_) => continue, // Timeout...
+            };
+            if let Ok(data) = compelete {
+                if let Some(controller) = self.inner.controller.wait().upgrade() {
+                    controller.on_metadata_downloaded(hash, data);
+                }
+                break; // Downloaded, exit
+            }
         }
-        info!("Downloading metadata for {} suspended, no more peers available", hash);
+        set.shutdown().await; // Cleanup....
     }
 
     // Do the attually download for given stream and hash
@@ -251,22 +219,16 @@ impl Downloader {
         return Ok(torrent);
     }
 
-    async fn download(&self, hash: InfoHash, ip: SocketAddr) -> Result<Vec<u8>, BtError> {
-        let mut info = BtHandshakeInfo {
-            hash: hash,
-            peer_id: PeerId::make(),
-            extensions: None,
-        };
-        info.set_metadata_id(1); // We want to download the metadata use this
-
+    async fn download(self, hash: InfoHash, ip: SocketAddr) -> Result<Vec<u8>, BtError> {
+        let info = self.make_handshake_info(hash);
         // Try try utp first
-        info!("Utp: Connecting to {ip}");
+        info!("Utp: Connecting to {ip} for hash {hash}");
         if let Ok(utp) = UtpSocket::connect(&self.inner.utp_context, ip).await {
             let stream = BtStream::client_handshake(utp, info).await?;
             return Downloader::do_download(stream, hash).await;
         }
         // Try tcp ...
-        info!("Tcp: Connecting to {ip}");
+        info!("Tcp: Connecting to {ip} for hash {hash}");
         let tcp = TcpStream::connect(ip).await?;
         let stream = BtStream::client_handshake(tcp, info).await?;
         return Downloader::do_download(stream, hash).await;
@@ -280,18 +242,14 @@ impl Downloader {
                 return Err(BtError::UserDefined("Controller dropped".into()));
             }
         };
+        let this = self.clone();
         let stream = BtStream::server_handshake(stream, |req| async move {
             info!("Handshake request: for hash {}", req.hash);
             if controller.has_metadata(req.hash) {
                 info!("Already have metadata for {}", req.hash);
                 return Err(BtError::HandshakeFailed);
             }
-            let mut info = BtHandshakeInfo {
-                hash: req.hash,
-                peer_id: PeerId::make(),
-                extensions: None,
-            };
-            info.set_metadata_id(1); // We want to download the metadata use this
+            let info = this.make_handshake_info(req.hash);
             return Ok(info);
         }).await?;
         let hash = stream.peer_info().hash;
@@ -305,7 +263,7 @@ impl Downloader {
         }?;
 
         // Save it
-        self.done_job(hash);
+        self.cancel(hash); // The hash is collected, no need to keep the worker
         if let Some(controller) = self.inner.controller.wait().upgrade() {
             controller.on_metadata_downloaded(hash, torrent);
         }
@@ -316,26 +274,57 @@ impl Downloader {
     /// Add a new peer to the downloader
     pub fn add_peer(&self, hash: InfoHash, ip: SocketAddr) {
         debug_assert!(self.inner.controller.get().is_some(), "Controller should be set");
-
-        let mut state = self.inner.state.lock().unwrap();
-        let inserted = state.map.entry(hash).or_insert(BTreeSet::new()).insert(ip);
-        if !inserted {
-            return; // Duplicate
+        let mut workers = self.inner.workers.lock().unwrap();
+        if let Some((_, sender)) = workers.get(&hash) {
+            // Already has worker for this hash
+            match sender.try_send(ip) {
+                Ok(_) => return,
+                Err(TrySendError::Full(_)) => { // FIXME: It may have a race condition, the worker is going to be dropped and we try to send to it
+                    error!("Worker for {hash} is too busy");
+                    return;
+                },
+                Err(TrySendError::Closed(_)) => {
+                    error!("Worker for {hash} is closed");
+                    return;
+                }
+            }
         }
-        if state.workers.contains(&hash) {
-            return;
-        }
-        // Start it
-        self.inner.start_worker.send(hash).expect("It shouldn't fail");
+        // Start an new worker
+        let (sender, receiver) = mpsc::channel(MAX_PENDING_PEERS);
+        let mut watch = self.inner.cancel_watch.wait().clone(); // For support cancellation
+        let this = self.clone();
+        sender.try_send(ip).expect("It should not fail"); // Send the first peer
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = watch.changed() => {
+                    info!("Worker for {hash} cancelled");
+                }
+                _ = this.worker_main(hash, receiver) => {
+                    info!("Worker for {hash} exited");
+                }
+            }
+            this.cancel(hash); // Doing cleanup
+        });
+        // Insert to the workers
+        workers.insert(hash, (handle.abort_handle(), sender));
     }
 
     /// Cancel a download
     pub fn cancel(&self, hash: InfoHash) {
-        self.done_job(hash);
+        // self.done_job(hash);
+        if let Some((handle, _)) = self.inner.workers.lock().unwrap().remove(&hash) {
+            handle.abort();
+        }
     }
 
     /// Set the controller
     pub fn set_controller(&self, controller: Weak<dyn DownloaderController + Send + Sync>) {
         let _ = self.inner.controller.set(controller);
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        let _ = self.sender.send(true);
     }
 }
