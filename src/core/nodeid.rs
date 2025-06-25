@@ -1,5 +1,8 @@
+use std::array::TryFromSliceError;
 use std::ops::{BitXor, Index, IndexMut};
 use std::fmt;
+
+use serde::{Deserialize, Serialize};
 
 /// The NodeId of the DHT, 160 bits
 /// 
@@ -188,23 +191,33 @@ impl From<[u8; 20]> for NodeId {
 }
 
 impl TryFrom<&[u8]> for NodeId {
-    type Error = ();
+    type Error = TryFromSliceError;
     
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        if value.len() != 20 {
-            return Err(());
-        }
-        let mut arr = [0u8; 20];
-        arr.copy_from_slice(value);
+        let arr: [u8; 20] = value.try_into()?;
         return Ok(NodeId::new(arr));
     }
 }
 
 impl TryFrom<&Vec<u8> > for NodeId {
-    type Error = ();
+    type Error = TryFromSliceError;
     fn try_from(value: &Vec<u8>) -> Result<Self, Self::Error> {
         let id = value.as_slice().try_into()?;
         return Ok(id);
+    }
+}
+
+
+impl Serialize for NodeId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        return serializer.serialize_str(&self.hex());
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeId {
+    fn deserialize<D: serde::Deserializer<'de> >(deserializer: D) -> Result<Self, D::Error> {
+        let hex_str = String::deserialize(deserializer)?;
+        return NodeId::from_hex(&hex_str).ok_or_else(|| serde::de::Error::custom("Invalid NodeId hex string"));
     }
 }
 

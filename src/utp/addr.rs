@@ -17,10 +17,10 @@ pub enum OsSocketAddr {
     V6(sockaddr_in6),
 }
 
-pub unsafe fn rs_addr_to_c(addr: &SocketAddr) -> OsSocketAddr {
+pub fn rs_addr_to_c(addr: &SocketAddr) -> OsSocketAddr {
     match addr {
         SocketAddr::V4(v4) => {
-            let mut addr: sockaddr_in = std::mem::zeroed();
+            let mut addr: sockaddr_in = unsafe { std::mem::zeroed() };
             addr.sin_family = AF_INET as u16;
             addr.sin_port = v4.port().to_be();
 
@@ -37,7 +37,7 @@ pub unsafe fn rs_addr_to_c(addr: &SocketAddr) -> OsSocketAddr {
             return OsSocketAddr::V4(addr);
         },
         SocketAddr::V6(v6) => {
-            let mut addr: sockaddr_in6 = std::mem::zeroed();
+            let mut addr: sockaddr_in6 = unsafe { std::mem::zeroed() };
             addr.sin6_family = AF_INET6 as u16;
             addr.sin6_port = v6.port().to_be();
             addr.sin6_flowinfo = v6.flowinfo();
@@ -59,51 +59,53 @@ pub unsafe fn rs_addr_to_c(addr: &SocketAddr) -> OsSocketAddr {
     }
 }
 
-pub unsafe fn c_addr_to_rs(addr: *const libc::sockaddr) -> SocketAddr {
-    match (*addr).sa_family {
-        AF_INET => {
-            let addr = &*(addr as *const sockaddr_in);
-            let bits;
+pub fn c_addr_to_rs(addr: *const libc::sockaddr) -> SocketAddr {
+    unsafe {
+        match (*addr).sa_family {
+            AF_INET => {
+                let addr = &*(addr as *const sockaddr_in);
+                let bits;
 
-            #[cfg(target_os = "windows")]
-            {
-                bits = addr.sin_addr.S_un.S_addr;
-            }
+                #[cfg(target_os = "windows")]
+                {
+                    bits = addr.sin_addr.S_un.S_addr;
+                }
 
-            #[cfg(target_os = "linux")]
-            {
-                bits = addr.sin_addr.s_addr;
-            }
+                #[cfg(target_os = "linux")]
+                {
+                    bits = addr.sin_addr.s_addr;
+                }
 
-            let v4addr = Ipv4Addr::from_bits(bits);
-            let port = u16::from_be(addr.sin_port);
+                let v4addr = Ipv4Addr::from_bits(bits);
+                let port = u16::from_be(addr.sin_port);
 
-            return SocketAddr::V4(SocketAddrV4::new(v4addr, port));
-        },
-        AF_INET6 => {
-            let addr = &*(addr as *const sockaddr_in6);
-            let sin6_scope_id;
-            let octets;
+                return SocketAddr::V4(SocketAddrV4::new(v4addr, port));
+            },
+            AF_INET6 => {
+                let addr = &*(addr as *const sockaddr_in6);
+                let sin6_scope_id;
+                let octets;
 
-            #[cfg(target_os = "windows")]
-            {
-                octets = addr.sin6_addr.u.Byte;
-                sin6_scope_id = addr.Anonymous.sin6_scope_id;
-            }
+                #[cfg(target_os = "windows")]
+                {
+                    octets = addr.sin6_addr.u.Byte;
+                    sin6_scope_id = addr.Anonymous.sin6_scope_id;
+                }
 
-            #[cfg(target_os = "linux")]
-            {
-                octets = addr.sin6_addr.s6_addr;
-                sin6_scope_id = addr.sin6_scope_id;
-            }
+                #[cfg(target_os = "linux")]
+                {
+                    octets = addr.sin6_addr.s6_addr;
+                    sin6_scope_id = addr.sin6_scope_id;
+                }
 
-            let v6addr = Ipv6Addr::from(octets);
-            let port = u16::from_be(addr.sin6_port);
-            let flowinfo = addr.sin6_flowinfo;
+                let v6addr = Ipv6Addr::from(octets);
+                let port = u16::from_be(addr.sin6_port);
+                let flowinfo = addr.sin6_flowinfo;
 
-            return SocketAddr::V6(SocketAddrV6::new(v6addr, port, flowinfo, sin6_scope_id));
-        },
-        _ => panic!("Unknown address family"),
+                return SocketAddr::V6(SocketAddrV6::new(v6addr, port, flowinfo, sin6_scope_id));
+            },
+            _ => panic!("Unknown address family"),
+        }
     }
 }
 

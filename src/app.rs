@@ -1,13 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tokio_stream::Stream;
 use std::{
-    collections::BTreeSet, 
-    convert::Infallible, 
-    fs, 
-    io::Write, 
-    net::SocketAddr, 
-    sync::{Arc, Mutex, MutexGuard}, 
-    time::Duration
+    convert::Infallible, fs, io::Write, net::SocketAddr, num::NonZero, sync::{Arc, Mutex, MutexGuard}, time::Duration
 };
 use tokio::{
     net, task::JoinHandle, sync::broadcast,
@@ -28,7 +22,7 @@ use serde_json::{
 // Import our own modules
 use dht_rs::{
     bt::Torrent, 
-    crawler::{Crawler, CrawlerConfig, CrawlerObserver}, 
+    crawler::{Crawler, CrawlerConfig, CrawlerController}, 
     *
 };
 
@@ -36,11 +30,10 @@ use tracing::{info};
 
 #[derive(Deserialize, Serialize, Clone)]
 struct Config {
-    webui_port: u16,
-    #[serde(default = "default_ip")]
-    webui_ip: String,
+    webui_addr: SocketAddr,
     bind_addr: SocketAddr,
-    node_id: String,
+    node_id: NodeId,
+    hash_lru: NonZero<usize>,
 }
 
 /// The request from the webui
@@ -59,10 +52,14 @@ struct Metadata {
     files: Option<Value>, // The files in the torrent [{ name: 'ubuntu.iso', size: '4.7 GB' }, { name: 'README.txt', size: '1.2 KB' }]
 }
 
+#[derive(Debug, Serialize)]
+struct Status {
+    running: bool,
+}
+
 struct AppInner {
     config: Mutex<Config>,
     crawler: Mutex<Option<(Crawler, JoinHandle<()>)> >, // The cralwer and its task handle
-    info_hashes: Mutex<BTreeSet<InfoHash> >, // The info hashes that we have found, TODO: use LRU cache
     storage: Storage, // The database 
     broadcast: broadcast::Sender<Option<String> >, // Push the events to the webui, none on shutdown
 }
@@ -72,25 +69,13 @@ pub struct App {
     inner: Arc<AppInner>,
 }
 
-fn default_ip() -> String {
-    return "127.0.0.1".into();
-}
-
 const MAX_SEARCH_PER_PAGES: usize = 25;
 
-impl CrawlerObserver for AppInner {
-    fn on_info_hash_found(&self, hash: InfoHash) -> bool {
-        let mut map = self.info_hashes.lock().unwrap();
-        let is_new = map.insert(hash);
-        if is_new { // Check exist in the filesystem?
-            if self.has_metadata(hash) {
-                return false; // Already exists
-            }
-            info!("Found a new info hash: {}", hash); // On Console!
-            let msg = format!("Found a new info hash: {}, {} in total", hash, map.len());
-            let _ = self.broadcast.send(Some(msg)); // On WebUI!
-        }
-        return is_new;
+impl CrawlerController for AppInner {
+    fn on_info_hash_found(&self, _hash: InfoHash) {
+        // info!("Found a new info hash: {}", hash); // On Console!
+        // let _ = self.broadcast.send(Some(msg)); // On WebUI!
+        // return false;
     }
 
     fn has_metadata(&self, hash: InfoHash) -> bool {
@@ -119,10 +104,12 @@ impl App {
             Err(_) => {
                 // Using default config
                 Config {
-                    webui_port: 10721, // Ciallo～(∠・ω< )
-                    webui_ip: "127.0.0.1".to_string(),
+                    webui_addr: "127.0.0.1:10721".parse().unwrap(), // Ciallo～(∠・ω< )
                     bind_addr: "0.0.0.0:0".parse().unwrap(),
-                    node_id: NodeId::rand().hex(),
+                    node_id: NodeId::rand(),
+
+                    // LRU Config
+                    hash_lru: NonZero::new(1000 * 10).unwrap(), // 10K
                 }
             },
         };
@@ -133,7 +120,6 @@ impl App {
                 AppInner {
                     config: Mutex::new(config),
                     crawler: Mutex::new(None),
-                    info_hashes: Mutex::new(BTreeSet::new()),
                     storage: Storage::open("./data/torrents.db").expect("Can not open the storage database"),
                     broadcast: sx,
                 }
@@ -150,7 +136,7 @@ impl App {
             // Basic API
             .route("/api/v1/start_dht", get(App::start_dht_handler))
             .route("/api/v1/stop_dht", get(App::stop_dht_handler))
-            .route("/api/v1/is_dht_running", get(App::is_dht_running_handler))
+            .route("/api/v1/status", get(App::status_handler))
 
             // SSE
             .route("/api/v1/sse/events", get(App::sse_events_handler))
@@ -170,10 +156,7 @@ impl App {
             .route("/api/v1/set_config", post(App::set_config_handler))
             .with_state(self.clone())
         ;
-        let addr: SocketAddr = {
-            let conf = self.config();
-            format!("{}:{}", conf.webui_ip, conf.webui_port).parse().expect("Not a valid address")
-        };
+        let addr = self.config().webui_addr;
         let listener = net::TcpListener::bind(addr).await.unwrap();
         println!("WebUI Listening on http://{}/", listener.local_addr().unwrap());
         let _ = axum::serve(listener, router)
@@ -227,21 +210,16 @@ impl App {
                 return String::from("DHT Already started");
             }
         }
-        let (id, addr) = {
-            let config = app.config();
-            let id = if config.node_id.is_empty() {
-                NodeId::rand()
-            }
-            else {
-                NodeId::from_hex(config.node_id.as_str()).unwrap()
-            };
+        // Create the crawler config by the config
+        let config = {
+            let conf = app.config();
 
-            (id, config.bind_addr)
-        };
-        let config = CrawlerConfig {
-            id: id,
-            ip: addr,
-            observer: app.inner.clone(),
+            CrawlerConfig {
+                id: conf.node_id,
+                ip: conf.bind_addr,
+                hash_lru_cache_size: conf.hash_lru,
+                controller: app.inner.clone(),
+            }
         };
         let crawler = match Crawler::new(config).await {
             Ok(crawler) => crawler,
@@ -260,12 +238,17 @@ impl App {
         return String::from("DHT already stopped");
     }
 
-    async fn is_dht_running_handler(State(app): State<App>) -> impl IntoResponse {
-        let crawler = app.inner.crawler.lock().unwrap();
-        if crawler.is_some() {
-            return String::from("true");
-        }
-        return String::from("false");
+    async fn status_handler(State(app): State<App>) -> impl IntoResponse {
+        let lock = app.inner.crawler.lock().unwrap();
+        let (_crawler, _) = match lock.as_ref() {
+            None => return Json(Status{
+                running: false,
+            }),
+            Some(crawler) => crawler,
+        };
+        return Json(Status{
+            running: true,
+        });
     }
 
     // Info Query
@@ -475,7 +458,6 @@ impl App {
                 "error" : err 
             })),
         }
-
     }
 
     // SSE

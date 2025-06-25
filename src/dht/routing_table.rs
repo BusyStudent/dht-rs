@@ -1,5 +1,5 @@
 // credit libtorrent
-#![allow(dead_code)] // Let it shutup!
+#![allow(dead_code, unused_imports)] // Let it shutup!
 
 use std::collections::{BTreeSet, VecDeque};
 use std::net::{SocketAddr};
@@ -234,15 +234,15 @@ impl RoutingTable {
             let node = &mut bucket.nodes[pos];
             match node.status {
                 NodeStatus::Questionable => {
-                    debug!("Node {} is timeout, before that is question, mark it as bad", node.id);
+                    // debug!("Node {} is timeout, before that is question, mark it as bad", node.id);
                     node.status = NodeStatus::Bad;
                 },
                 NodeStatus::Good => {
-                    debug!("Node {} is timeout, mark it as questionable", node.id);
+                    // debug!("Node {} is timeout, mark it as questionable", node.id);
                     node.status = NodeStatus::Questionable;
                 },
                 NodeStatus::Bad => {
-                    info!("Node {} is timeout, and bad, remove it", node.id);
+                    // info!("Node {} is timeout, and bad, remove it", node.id);
                     bucket.nodes.remove(pos);
                 },
             }

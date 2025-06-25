@@ -1,10 +1,7 @@
 #![allow(dead_code, unused_imports)] // Let it shutup!
 
 use std::{
-    collections::BTreeMap,
-    net::SocketAddr,
-    sync::{Arc, Mutex, OnceLock},
-    cell::OnceCell,
+    cell::OnceCell, collections::BTreeMap, net::SocketAddr, sync::{Arc, Mutex, Weak, OnceLock}
 };
 
 use crate::{dht::DhtSession, InfoHash, PeerId};
@@ -15,13 +12,11 @@ use tokio::{
 };
 use tracing::info;
 
-pub type PeerFinderCallback = Box<dyn Fn(InfoHash, SocketAddr) + Send + Sync>;
-
 struct PeerFinderInner {
     dht_session: DhtSession, // The dht session we used to call get_peers
     pending: Mutex<BTreeMap<InfoHash, JoinHandle<()>>>,
     sem: Semaphore, // Semaphore to limit the number of concurrent peer finding tasks
-    callback: OnceLock<PeerFinderCallback>,
+    controller: OnceLock<Weak<dyn PeerFinderController + Sync + Send> >,
 
     // Config
     max_retries: usize,
@@ -38,6 +33,10 @@ pub struct PeerFinderConfig {
     pub max_retries: usize,
 }
 
+pub trait PeerFinderController {
+    fn on_peers_found(&self, hash: InfoHash, peers: Vec<SocketAddr>);
+}
+
 impl PeerFinder {
     pub fn new(config: PeerFinderConfig) -> Self {
         return Self {
@@ -46,7 +45,7 @@ impl PeerFinder {
                 pending: Mutex::new(BTreeMap::new()),
                 sem: Semaphore::new(config.max_concurrent),
                 max_retries: config.max_retries,
-                callback: OnceLock::new(),
+                controller: OnceLock::new(),
             }),
         };
     }
@@ -55,18 +54,18 @@ impl PeerFinder {
     pub fn cancel(&self, info_hash: InfoHash) {
         let mut map = self.inner.pending.lock().unwrap();
         if let Some(handle) = map.remove(&info_hash) {
-            info!("Canceling peer finding task for {}", info_hash);
+            info!("Canceling peer finding task for {}, {} left", info_hash, map.len());
             handle.abort();
         }
     }
 
-    pub fn set_callback(&self, callback: PeerFinderCallback) {
-        let _ = self.inner.callback.set(callback);
+    pub fn set_controller(&self, callback: Weak<dyn PeerFinderController + Sync + Send>) {
+        let _ = self.inner.controller.set(callback);
     }
 
-    /// Add a new info hash to the peer finding queue, MUST be called after set_callback
+    /// Add a new info hash to the peer finding queue, MUST be called after set_controller
     pub fn add_hash(&self, info_hash: InfoHash) {
-        debug_assert!(self.inner.callback.get().is_some(), "Must set callback before adding hashes");
+        debug_assert!(self.inner.controller.get().is_some(), "Must set controller before adding hashes");
         let mut map = self.inner.pending.lock().unwrap();
         if map.contains_key(&info_hash) {
             return;
@@ -84,11 +83,13 @@ impl PeerFinder {
             info!("Finding peers for {}", hash);
             if let Ok(result) = self.inner.dht_session.clone().get_peers(hash).await {
                 info!("Found {} peers for {}", result.peers.len(), hash);
-                // Call the callback for each peer
-                let cb = self.inner.callback.wait();
-                for peer in result.peers {
-                    cb(hash, peer);
+                // Call the controller for each peer
+                if let Some(controller) = self.inner.controller.wait().upgrade() {
+                    if !result.peers.is_empty() {
+                        controller.on_peers_found(hash, result.peers);
+                    }
                 }
+                
                 // Begin announcing the peers
                 let mut set = JoinSet::new();
                 for node in result.nodes {

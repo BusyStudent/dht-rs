@@ -4,7 +4,7 @@ use crate::{
     bt::*,
     crawler::{
         downloader::{Downloader, DownloaderController},
-        peer_finder::{PeerFinder, PeerFinderConfig}, sampler::{Sampler, SamplerObserver},
+        peer_finder::{PeerFinder, PeerFinderConfig, PeerFinderController}, sampler::{Sampler, SamplerObserver},
     },
     dht::*,
     krpc::*,
@@ -12,14 +12,12 @@ use crate::{
     InfoHash, NodeId,
 };
 use std::{
-    collections::BTreeSet,
-    io,
-    net::SocketAddr,
-    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, MutexGuard},
+    collections::BTreeSet, io, net::SocketAddr, num::NonZero, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, MutexGuard}
 };
 use async_trait::async_trait;
 use tokio::{net::UdpSocket, sync::{Semaphore, mpsc}, task::JoinSet};
 use tracing::{error, info};
+use lru::LruCache;
 
 struct CrawlerInner {
     udp: Arc<UdpSocket>,
@@ -28,8 +26,10 @@ struct CrawlerInner {
     downloader: Downloader,
     peer_finder: PeerFinder,
     sampler: Sampler,
-    observer: Arc<dyn CrawlerObserver + Send + Sync>,
+    controller: Arc<dyn CrawlerController + Send + Sync>,
 
+    // State
+    hash_lru: Mutex<LruCache<InfoHash, ()> >,
     auto_sample: AtomicBool,
 }
 
@@ -42,20 +42,19 @@ pub struct Crawler {
 pub struct CrawlerConfig {
     pub id: NodeId,
     pub ip: SocketAddr, // Bind addr
-    pub observer: Arc<dyn CrawlerObserver + Send + Sync>,
+    pub hash_lru_cache_size: NonZero<usize>,
+    pub controller: Arc<dyn CrawlerController + Send + Sync>,
 }
 
-pub trait CrawlerObserver {
-    /// Called when a peer announce a info hash, return false if the info hash is already in the list
-    fn on_info_hash_found(&self, _info_hash: InfoHash) -> bool {
-        return true;
-    }
+pub trait CrawlerController {
+    /// Called when we found a new hash, it may duplicate because LruCache
+    fn on_info_hash_found(&self, hash: InfoHash);
 
     /// Called when a metadata is downloaded
-    fn on_metadata_downloaded(&self, _info_hash: InfoHash, _data: Vec<u8>);
+    fn on_metadata_downloaded(&self, hash: InfoHash, _data: Vec<u8>);
 
     /// Check did we has this metadata?
-    fn has_metadata(&self, info_hash: InfoHash) -> bool;
+    fn has_metadata(&self, hash: InfoHash) -> bool;
 }
 
 impl Crawler {
@@ -92,17 +91,15 @@ impl Crawler {
                 downloader: Downloader::new(utp, id),
                 peer_finder: PeerFinder::new(finder_config),
                 sampler: Sampler::new(session.clone()),
-                observer: config.observer,
+                controller: config.controller,
 
-                auto_sample: AtomicBool::new(true),
+                auto_sample: AtomicBool::new(false),
+                hash_lru: Mutex::new(LruCache::new(config.hash_lru_cache_size)),
             }),
         };
 
         let weak = Arc::downgrade(&this.inner);
-        this.inner.peer_finder.set_callback(Box::new(move |info_hash, addr| match weak.upgrade() {
-            Some(this) => Crawler::on_peer_found(this, info_hash, addr),
-            None => {}
-        }));
+        this.inner.peer_finder.set_controller(weak);
 
         // Set the observer for dht session
         let weak = Arc::downgrade(&this.inner);
@@ -144,13 +141,6 @@ impl Crawler {
         }
     }
 
-    /// From peer finder
-    fn on_peer_found(inner: Arc<CrawlerInner>, info_hash: InfoHash, ip: SocketAddr) {
-        if !inner.observer.has_metadata(info_hash) {
-            inner.downloader.add_peer(info_hash, ip);
-        }
-    }
-
     /// Get the routing table of the crawler
     pub fn dht_session(&self) -> &DhtSession {
         return &self.inner.dht_session;
@@ -172,37 +162,50 @@ impl Crawler {
             self.process_udp(),           // The network loop
             self.inner.dht_session.run(), // The dht loop
             self.inner.downloader.run(),  // The download loop
-            self.inner.sampler.run()      // The sampler loop
         );
     }
 }
 
-// TODO.. Delegate the weak to avoid memory leak
+impl CrawlerInner {
+    fn check_hash_lru(&self, hash: InfoHash) -> bool {
+        let mut lru = self.hash_lru.lock().unwrap();
+        return lru.put(hash, ()).is_none();
+    }
+}
 
 // Delegate the downloader controller to the crawler
 impl DownloaderController for CrawlerInner {
-    fn on_metadata_downloaded(&self, info_hash: InfoHash, data: Vec<u8>) {
-        self.peer_finder.cancel(info_hash); // Cancel the peer finding, we got the metadata
-        return self.observer.on_metadata_downloaded(info_hash, data);
+    fn on_metadata_downloaded(&self, hash: InfoHash, data: Vec<u8>) {
+        self.peer_finder.cancel(hash); // Cancel the peer finding, we got the metadata
+        return self.controller.on_metadata_downloaded(hash, data);
     }
 
-    fn has_metadata(&self, info_hash: InfoHash) -> bool {
-        return self.observer.has_metadata(info_hash);
+    fn has_metadata(&self, hash: InfoHash) -> bool {
+        return self.controller.has_metadata(hash);
+    }
+}
+
+impl PeerFinderController for CrawlerInner {
+    fn on_peers_found(&self, hash: InfoHash, peers: Vec<SocketAddr>) {
+        if !self.controller.has_metadata(hash) {
+            for peer in peers {
+                self.downloader.add_peer(hash, peer);                
+            }
+        }
     }
 }
 
 #[async_trait]
 impl DhtSessionObserver for CrawlerInner {
     /// From dht session
-    async fn on_peer_announce(&self, info_hash: InfoHash, ip: SocketAddr) {
-        if self.observer.has_metadata(info_hash) { // Already has the metadata
+    async fn on_peer_announce(&self, hash: InfoHash, ip: SocketAddr) {
+        if self.controller.has_metadata(hash) { // Already has the metadata
             return;
         }
-        if self.observer.on_info_hash_found(info_hash) {
-            // New, add to peer finder
-            self.peer_finder.add_hash(info_hash);
+        if self.check_hash_lru(hash) { // Exist in lru cache?
+            self.peer_finder.add_hash(hash);
         }
-        self.downloader.add_peer(info_hash, ip);
+        self.downloader.add_peer(hash, ip);
     }
 
     async fn on_query(&self, _: &[u8], ip: SocketAddr) {
@@ -220,7 +223,7 @@ impl SamplerObserver for CrawlerInner {
             if self.has_metadata(hash) {
                 continue;
             }
-            if self.observer.on_info_hash_found(hash) {
+            if self.check_hash_lru(hash) {
                 // New, add to peer finder
                 self.peer_finder.add_hash(hash);
             }

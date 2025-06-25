@@ -1,9 +1,10 @@
 #![allow(dead_code)] // SHUTUP
 
-use std::{collections::{HashMap}, net::SocketAddr, sync::{Arc, Mutex, OnceLock, Weak}, time::{Duration, SystemTime}};
+use std::{net::SocketAddr, num::NonZero, sync::{Arc, Mutex, OnceLock, Weak}, time::{Duration, SystemTime}};
 
 use tokio::{sync::Semaphore};
 use async_trait::async_trait;
+use lru::LruCache;
 // use tracing::{info};
 
 use crate::{dht::DhtSession, InfoHash, NodeId};
@@ -11,7 +12,7 @@ use crate::{dht::DhtSession, InfoHash, NodeId};
 struct SamplerInner {
     dht_session: DhtSession, // DHT session for using sample_infohashes
     sem: Semaphore, // Semaphore to limit the number of concurrent samples
-    sampled: Mutex<HashMap<SocketAddr, Option<SystemTime> > >, // Mapping the sampled node to the next time we can sample it, None means we are currently sampling it
+    sampled: Mutex<LruCache<SocketAddr, Option<SystemTime> > >, // Mapping the sampled node to the next time we can sample it, None means we are currently sampling it
     observer: OnceLock<Weak<dyn SamplerObserver + Sync + Send> >,
 }
 
@@ -28,11 +29,12 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn new(session: DhtSession) -> Self {
+        let _100k = NonZero::try_from(100 * 1000).unwrap();
         return Self {
             inner: Arc::new(SamplerInner {
                 dht_session: session,
                 sem: Semaphore::new(5),
-                sampled: Mutex::new(HashMap::new()),
+                sampled: Mutex::new(LruCache::new(_100k)), // 100K
                 observer: OnceLock::new(),
             })
         }
@@ -59,7 +61,7 @@ impl Sampler {
             }
         }
         // info!("Sampling {ip}");
-        sampled.insert(ip, None); // We are going to sample this node
+        sampled.put(ip, None); // We are going to sample this node
 
         // Start it
         tokio::spawn(self.clone().do_sample(ip));
@@ -98,21 +100,12 @@ impl Sampler {
         // Update the time...
         {
             let mut sampled = self.inner.sampled.lock().unwrap();
-            sampled.insert(ip, Some(SystemTime::now() + duration));
+            sampled.put(ip, Some(SystemTime::now() + duration));
         }
 
         // Notify the observer if we have any hashes
         if !hashes.is_empty() {
             observer.on_hash_sampled(hashes).await;
-        }
-    }
-
-    pub async fn run(&self) {
-        // TODO:
-        loop {
-            tokio::time::sleep(Duration::from_secs(60 * 60 * 2)).await; // 2 hours clean up
-            let mut sampled = self.inner.sampled.lock().unwrap();
-            sampled.clear();
         }
     }
 }

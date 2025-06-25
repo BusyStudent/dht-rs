@@ -110,16 +110,46 @@ impl Storage {
             ORDER BY added DESC
             LIMIT ?1 OFFSET ?2
         ";
+        let sql_like = "
+            SELECT hash, name, size, files,
+                   COUNT(*) OVER () AS total_count
+            FROM torrents
+            WHERE name LIKE '%' || ?1 || '%'
+            ORDER BY added DESC
+            LIMIT ?2 OFFSET ?3
+        ";
         let trimmed_query = query.trim();
+        let escape_query = Self::escape_fts_query(trimmed_query);
         let conn = self.conn.lock().unwrap();
 
         let (sql, param) = match trimmed_query {
             "*" => (sql_all, params![limit, offset]), // Search all torrents
-            _ => (sql_search, params![query, limit, offset]), // Search torrents with the query
-        };            
+            _ => {
+                if trimmed_query.chars().count() < 3 || escape_query.is_none() {
+                    (sql_like, params![query, limit, offset]) // Bad with FTS, use LIKE instead
+                }
+                else {
+                    (sql_search, params![query, limit, offset]) // Use FTS
+                }
+            }
+        };
 
         let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query(param)?;
+        let rows = stmt.query(param)?;
+
+        return Self::collect_results(rows);
+    }
+
+    fn escape_fts_query(input: &str) -> Option<String> {
+        // Reject if it contains characters that cause MATCH to panic
+        if input.contains(|c: char| c == '"' || c == ':' || c == '*' || c == '-' || c == '[' || c == ']' ) {
+            return None;
+        }
+
+        return Some(format!("\"{}\"", input))
+    }
+
+    fn collect_results(mut rows: rusqlite::Rows<'_>) -> Result<TorrentInfoList> {
         let mut torrents = Vec::new();
         let mut total = 0;
 

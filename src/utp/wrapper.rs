@@ -153,39 +153,41 @@ impl UtpContext {
 
 impl UtpContextInner {
     unsafe extern "C" fn callback_wrapper(args_ptr: *mut utp_callback_arguments) -> u64 {
-        let args = &*args_ptr;
-        let this = utp_context_get_userdata(args.context) as *mut UtpContextInner;
+        unsafe {
+            let args = &*args_ptr;
+            let this = utp_context_get_userdata(args.context) as *mut UtpContextInner;
 
-        debug_assert!(!this.is_null()); // Impossible to happen, we always set the userdata
-        return (*this).callback(&args);
+            debug_assert!(!this.is_null()); // Impossible to happen, we always set the userdata
+            return (*this).callback(&args);
+        }
     }
 
     /// Get the socket reference from the arguments
-    unsafe fn get_socket(args: &utp_callback_arguments) -> Option<&UtpSocketInner> {
+    fn get_socket(args: &utp_callback_arguments) -> Option<&UtpSocketInner> {
         if args.socket.is_null() {
             return None;
         }
-        let socket = utp_get_userdata(args.socket) as *mut UtpSocketInner;
+        let socket = unsafe { utp_get_userdata(args.socket) } as *mut UtpSocketInner;
         if socket.is_null() {
             // Maybe close already
             return None;
         }
-        return Some(&*socket);
+        return Some(unsafe { &*socket });
     }
 
-    unsafe fn callback(&mut self, args: &utp_callback_arguments) -> u64 {
-        let cb: UTP_CALLBACK = std::mem::transmute(args.callback_type); // The UTP_CALLBACK directly taken from the C headers, so it is safe to transmute
+    fn callback(&mut self, args: &utp_callback_arguments) -> u64 {
+        let cb: UTP_CALLBACK = unsafe { std::mem::transmute(args.callback_type) }; // The UTP_CALLBACK directly taken from the C headers, so it is safe to transmute
         match cb {
             // Context...
             UTP_CALLBACK::SENDTO => {
-                let data = std::slice::from_raw_parts(args.buf, args.len);
-                let addr = c_addr_to_rs(args.data1.address);
+                let data = unsafe { std::slice::from_raw_parts(args.buf, args.len) };
+                let addr = c_addr_to_rs(unsafe { args.data1.address });
                 return self.on_sendto(data, addr);
             }
 
             // Socket...
             UTP_CALLBACK::ON_STATE_CHANGE => {
-                let state = std::mem::transmute(args.data1.state); // As same as above
+                let state = unsafe { std::mem::transmute(args.data1.state) }; // As same as above
                 debug!("UtpSocket {:?} state changed to {:?}", args.socket, state);
                 if let Some(sock) = UtpContextInner::get_socket(args) {
                     sock.on_state_change(state);
@@ -193,7 +195,7 @@ impl UtpContextInner {
                 return 0;
             }
             UTP_CALLBACK::ON_ERROR => {
-                let error = std::mem::transmute(args.data1.error_code); // As same as above
+                let error = unsafe { std::mem::transmute(args.data1.error_code) }; // As same as above
                 debug!("UtpSocket {:?} error {:?}", args.socket, error);
                 if let Some(sock) = UtpContextInner::get_socket(args) {
                     sock.on_error(error);
@@ -201,7 +203,7 @@ impl UtpContextInner {
                 return 0;
             }
             UTP_CALLBACK::ON_READ => {
-                let data = std::slice::from_raw_parts(args.buf, args.len);
+                let data = unsafe { std::slice::from_raw_parts(args.buf, args.len) };
                 if let Some(sock) = UtpContextInner::get_socket(args) {
                     sock.on_read(data);
                 }
@@ -217,7 +219,7 @@ impl UtpContextInner {
                     }
                 }
                 // The queue is full, we need to close the socket
-                utp_close(sock);
+                unsafe { utp_close(sock) };
                 return 0;
             }
             _ => {

@@ -92,6 +92,16 @@ impl Object {
         return self.as_dict()?.get(key);
     }
 
+    /// Get the list object value by index, it will check if it is list
+    pub fn at(&self, index: usize) -> Option<&Object> {
+        return self.as_list()?.get(index);
+    }
+
+    /// Check if the dict object contains the key, it will check if it is dict
+    pub fn contains_key(&self, key: &[u8]) -> Option<bool> {
+        return Some(self.as_dict()?.contains_key(key));
+    }
+
     /// Parse any bencoded input, raw version
     pub fn decode(bytes: &[u8]) -> Option<(Object, &[u8])> {
         return match bytes.first()? {
@@ -353,10 +363,10 @@ mod tests {
             Some((decoded_obj, left)) => {
                 assert_eq!(&decoded_obj, original_obj, "not eq: {:?}", encoded_bytes);
                 assert!(left.is_empty());
-            },
+            }
             None => {
                 panic!("can not decode: {:?}", encoded_bytes);
-            },
+            }
         }
     }
 

@@ -381,25 +381,8 @@
             <div id="pagination-controls"></div>
         </div>
 
-        <!-- 设置 -->
-        <div id="settings-content" class="tab-content">
-            <h2>设置</h2>
-            <div class="form-group">
-                <label for="webui-port-input">WebUI 绑定端口</label>
-                <input type="number" id="webui-port-input" placeholder="例如: 10721 Ciallo～(∠・ω< )">
-            </div>
-            <div class="form-group">
-                <label for="bind-addr-input">DHT 绑定地址</label>
-                <input type="text" id="bind-addr-input" placeholder="不可以为空">
-            </div>
-            <div class="form-group">
-                <label for="node-id-input">节点ID (Node ID)</label>
-                <input type="text" id="node-id-input" placeholder="留空则自动生成">
-            </div>
-            <button id="save-settings-btn" class="button">保存设置</button>
-        </div>
         
-        <!-- [新增] 工具界面 -->
+        <!-- 工具界面 -->
         <div id="tools-content" class="tab-content">
             <h2>手动工具</h2>
             <p>用于手动向 DHT 网络中的特定节点发送请求，以进行调试。</p>
@@ -479,6 +462,29 @@
                 </div>
                 <button class="button tool-btn" data-tool="add_hash">添加到索引 尝试获取元数据</button>
                 <pre id="tools-add-hash-response" class="tool-response">响应将显示在此处</pre>
+            </div>
+        </div>
+
+        <!-- 设置 -->
+        <div id="settings-content" class="tab-content">
+            <h2>设置</h2>
+            <div class="form-group">
+                <label for="webui-addr-input">WebUI 绑定地址</label>
+                <input type="text" id="webui-addr-input" placeholder="例如: 127.0.0.1:10721 Ciallo～(∠・ω< )">
+            </div>
+            <div class="form-group">
+                <label for="bind-addr-input">DHT 绑定地址</label>
+                <input type="text" id="bind-addr-input" placeholder="不可以为空">
+            </div>
+            <div class="form-group">
+                <label for="node-id-input">节点ID (Node ID)</label>
+                <input type="text" id="node-id-input" placeholder="留空则自动生成">
+            </div>
+            <div class="form-group">
+                <label for="hash-lru-input">Hash LRU缓存的大小</label>
+                <input type="number" id="hash-lru-input" placeholder="不能为0">
+            </div>
+            <button id="save-settings-btn" class="button">保存设置</button>
         </div>
 
     </div>
@@ -622,9 +628,9 @@
     // 看看有没有已经启动了
     async function queryStatus() {
         try {
-            const response = await fetch('/api/v1/is_dht_running');
-            const running = await response.json();
-            if (running) {
+            const response = await fetch('/api/v1/status');
+            const status = await response.json();
+            if (status["running"]) {
                 document.getElementById('start-btn').style.display = 'none';
                 document.getElementById('stop-btn').style.display = 'inline-block';
             }
@@ -1015,13 +1021,11 @@
                 return;
             }
             const config = await response.json();
-            const port = config['webui_port'];
-            const addr = config['bind_addr'];
-            const id = config['node_id'];
 
-            document.getElementById('webui-port-input').value = port;
-            document.getElementById('bind-addr-input').value = addr;
-            document.getElementById('node-id-input').value = id;
+            document.getElementById('webui-addr-input').value = config['webui_addr'];
+            document.getElementById('bind-addr-input').value = config['bind_addr'];
+            document.getElementById('node-id-input').value = config['node_id'];
+            document.getElementById('hash-lru-input').value = config['hash_lru'];
         }
         catch (e) {
             console.log(e);
@@ -1029,9 +1033,10 @@
     }
     async function saveSettings() {
         addLog("正在保存设置...");
-        const port = document.getElementById('webui-port-input').value;
+        const webui_addr = document.getElementById('webui-addr-input').value;
         const addr = document.getElementById('bind-addr-input').value;
         const id = document.getElementById('node-id-input').value;
+        const hash_lru = document.getElementById('hash-lru-input').value;
 
         try {
             const response = await fetch('/api/v1/set_config', {
@@ -1039,7 +1044,12 @@
                 headers: {
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({ webui_port: parseInt(port), bind_addr: addr, node_id: id })
+                body: JSON.stringify({ 
+                    webui_addr: webui_addr, 
+                    bind_addr: addr, 
+                    node_id: id,
+                    hash_lru: parseInt(hash_lru, 10)
+                })
             });
             const text = await response.text();
 
