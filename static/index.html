@@ -359,6 +359,7 @@
             <div>
                 <button id="start-btn" class="button">启动爬虫</button>
                 <button id="stop-btn" class="button danger" style="display: none;">停止爬虫</button>
+                <button id="active-sample-btn" class="button" style="display: none; margin-left: 10px;">启动主动采样</button>
             </div>
             <h3 style="margin-top: 20px; margin-bottom: 10px;">日志输出</h3>
             <div id="log-window"></div>
@@ -533,6 +534,10 @@
         document.getElementById('stop-btn').addEventListener('click', () => {
             stopCrawler();
         });
+        // 主动采样
+        document.getElementById('active-sample-btn').addEventListener('click', () => {
+            setActiveSample();
+        })
 
         // 搜索框输入（防抖）
         document.getElementById('search-input').addEventListener('input', (e) => {
@@ -593,7 +598,7 @@
             searchMetadata(page);
         });
 
-        // [新增] 手动工具区域的事件委托
+        // 手动工具区域的事件委托
         document.getElementById('tools-content').addEventListener('click', (e) => {
             const target = e.target;
     
@@ -625,18 +630,44 @@
     }
 
     // --- 与后端交互的函数 ---
+    function updateStartButtonStates(isRunning) {
+        const startBtn = document.getElementById('start-btn');
+        const stopBtn = document.getElementById('stop-btn');
+        const activeSampleBtn = document.getElementById('active-sample-btn');
+
+        if (isRunning) {
+            startBtn.style.display = 'none';
+            stopBtn.style.display = 'inline-block';
+            activeSampleBtn.style.display = 'inline-block';
+        }
+        else {
+            startBtn.style.display = 'inline-block';
+            stopBtn.style.display = 'none';
+            activeSampleBtn.style.display = 'none';
+        }
+    }
+    function updateSampleButtonStatus(enable) {
+        const activeSampleBtn = document.getElementById('active-sample-btn');
+        if (enable) {
+            activeSampleBtn.textContent = '关闭主动采样';
+            activeSampleBtn.className = 'button danger';
+        }
+        else {
+            activeSampleBtn.textContent = '开启主动采样';
+            activeSampleBtn.className = 'button';
+        }
+    }
+
     // 看看有没有已经启动了
     async function queryStatus() {
         try {
             const response = await fetch('/api/v1/status');
             const status = await response.json();
+
+            updateStartButtonStates(status['running']);
             if (status["running"]) {
-                document.getElementById('start-btn').style.display = 'none';
-                document.getElementById('stop-btn').style.display = 'inline-block';
-            }
-            else {
-                document.getElementById('stop-btn').style.display = 'none';
-                document.getElementById('start-btn').style.display = 'inline-block';
+                // 设置额外字段
+                updateSampleButtonStatus(status['auto_sample']);
             }
         }
         catch (e) {
@@ -659,13 +690,13 @@
             addLog(`后端返回: ${data}`);
 
             // 显示停止按钮，隐藏开始按钮
-            document.getElementById('start-btn').style.display = 'none';
-            document.getElementById('stop-btn').style.display = 'inline-block';
+            updateStartButtonStates(true);
         }
         catch (e) {
             console.log(e);
         }
     }
+
     async function stopCrawler() {
         if (document.getElementById('stop-btn').style.display === 'none') {
             return; // 早就有个任务在停止了
@@ -681,13 +712,38 @@
             addLog(`后端返回: ${data}`);
 
             // 显示开始按钮，隐藏停止按钮
-            document.getElementById('stop-btn').style.display = 'none';
-            document.getElementById('start-btn').style.display = 'inline-block';
+            updateStartButtonStates(false);
         }
         catch (e) {
             console.log(e);
         }
     }
+
+    async function setActiveSample() {
+        const btn = document.getElementById('active-sample-btn');
+        let enabled = btn.className == 'button danger'; // 是不是已经启动了？
+        enabled = !enabled;
+
+        try {
+            const response = await fetch('/api/v1/set/auto_sample', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(enabled)
+            });
+            const json = await response.json();
+            if (json['error']) {
+                throw new Error(json['error']);
+            }
+            const current = json['current'];
+            updateSampleButtonStatus(current);
+        }
+        catch (e) {
+            console.log(e);
+        }
+    }
+
     function addLog(message) {
         const logWindow = document.getElementById('log-window');
         const timestamp = new Date().toLocaleTimeString();

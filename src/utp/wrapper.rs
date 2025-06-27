@@ -4,6 +4,7 @@ use super::addr::*;
 use super::ffi::*;
 use libc::{c_int, c_void, size_t};
 use tracing::info;
+use std::fmt;
 use std::sync::Weak;
 use std::{
     collections::VecDeque,
@@ -533,9 +534,19 @@ impl UtpListener {
     }
 }
 
+impl fmt::Debug for UtpSocket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.peer_addr() {
+            Some(addr) => return write!(f, "UtpSocket({:?} on {})", self.inner.utp_socket.get(), addr),
+            None => return write!(f, "UtpSocket({:?})", self.inner.utp_socket.get()),
+        }
+    }
+}
+
 impl Drop for UtpSocket {
     fn drop(&mut self) {
         unsafe {
+            info!("{:?} is dropped", self);
             let _lock = self.ctxt.utp_ctxt.lock().unwrap(); // We need to lock the context to close the socket
             utp_set_userdata(self.inner.utp_socket.get(), std::ptr::null_mut()); // Clear the inner we bind
             utp_close(self.inner.utp_socket.get());

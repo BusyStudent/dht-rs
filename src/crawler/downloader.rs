@@ -94,14 +94,14 @@ impl Downloader {
     async fn listener_main(&self) {
         let mut listener = UtpListener::new(&self.inner.utp_context, 10); // MAX 10 pending.
         loop {
-            let (stream, peer) = match listener.accept().await {
+            let (stream, _peer) = match listener.accept().await {
                 Ok(val) => val,
                 Err(e) => {
                     error!("Failed to use UtpListener::accept() => {e}");
                     return;
                 }
             };
-            info!("Utp: Incoming peer from {}", peer);
+            info!("Utp: Incoming peer {:?}", stream);
 
             tokio::spawn(self.clone().handle_incoming(stream));
         }
@@ -154,7 +154,7 @@ impl Downloader {
     }
 
     // Do the attually download for given stream and hash
-    async fn do_download<T: AsyncRead + AsyncWrite + Unpin>(mut stream: BtStream<T>, hash: InfoHash) -> Result<Vec<u8>, BtError> {
+    async fn download_impl<T: AsyncRead + AsyncWrite + Unpin>(mut stream: BtStream<T>, hash: InfoHash) -> Result<Vec<u8>, BtError> {
         info!("Peer extension info: {:?}", stream.peer_info().extensions);
         let metadata_id = stream
             .peer_info()
@@ -225,16 +225,16 @@ impl Downloader {
         info!("Utp: Connecting to {ip} for hash {hash}");
         if let Ok(utp) = UtpSocket::connect(&self.inner.utp_context, ip).await {
             let stream = BtStream::client_handshake(utp, info).await?;
-            return Downloader::do_download(stream, hash).await;
+            return Self::download_impl(stream, hash).await;
         }
         // Try tcp ...
         info!("Tcp: Connecting to {ip} for hash {hash}");
         let tcp = TcpStream::connect(ip).await?;
         let stream = BtStream::client_handshake(tcp, info).await?;
-        return Downloader::do_download(stream, hash).await;
+        return Self::download_impl(stream, hash).await;
     }
 
-    async fn handle_incoming(self, stream: UtpSocket) -> Result<(), BtError>{
+    async fn handle_incoming_impl<T: AsyncRead + AsyncWrite + Unpin>(&self, stream: T) -> Result<(), BtError> {
         let controller = match self.inner.controller.wait().upgrade() {
             Some(val) => val,
             None => {
@@ -253,13 +253,10 @@ impl Downloader {
             return Ok(info);
         }).await?;
         let hash = stream.peer_info().hash;
-        let res = tokio::time::timeout(
-        MAX_DOWNLOAD_TIME, 
-        Downloader::do_download(stream, hash)
-        ).await;
+        let res = tokio::time::timeout(MAX_DOWNLOAD_TIME, Self::download_impl(stream, hash)).await;
         let torrent = match res {
             Ok(val) => val,
-            Err(_) => return Ok(()),
+            Err(_) => return Err(BtError::UserDefined("TimedOut".into())),
         }?;
 
         // Save it
@@ -269,6 +266,16 @@ impl Downloader {
         }
         return Ok(());
 
+    }
+
+    async fn handle_incoming<T: AsyncRead + AsyncWrite + Unpin>(self, stream: T) {
+        match self.handle_incoming_impl(stream).await {
+            Ok(_) => {}
+            Err(_) => {
+                
+            }
+        }
+        return;
     }
 
     /// Add a new peer to the downloader

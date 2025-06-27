@@ -52,9 +52,12 @@ struct Metadata {
     files: Option<Value>, // The files in the torrent [{ name: 'ubuntu.iso', size: '4.7 GB' }, { name: 'README.txt', size: '1.2 KB' }]
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Default)]
 struct Status {
     running: bool,
+
+    // Field only when running
+    auto_sample: Option<bool>,
 }
 
 struct AppInner {
@@ -74,8 +77,8 @@ const MAX_SEARCH_PER_PAGES: usize = 25;
 impl CrawlerController for AppInner {
     fn on_info_hash_found(&self, _hash: InfoHash) {
         // info!("Found a new info hash: {}", hash); // On Console!
-        // let _ = self.broadcast.send(Some(msg)); // On WebUI!
-        // return false;
+        let msg = format!("Found a new info hash: {}", _hash);
+        let _ = self.broadcast.send(Some(msg)); // On WebUI!
     }
 
     fn has_metadata(&self, hash: InfoHash) -> bool {
@@ -137,6 +140,7 @@ impl App {
             .route("/api/v1/start_dht", get(App::start_dht_handler))
             .route("/api/v1/stop_dht", get(App::stop_dht_handler))
             .route("/api/v1/status", get(App::status_handler))
+            .route("/api/v1/set/{*var}", post(App::set_var_handler))
 
             // SSE
             .route("/api/v1/sse/events", get(App::sse_events_handler))
@@ -240,15 +244,49 @@ impl App {
 
     async fn status_handler(State(app): State<App>) -> impl IntoResponse {
         let lock = app.inner.crawler.lock().unwrap();
-        let (_crawler, _) = match lock.as_ref() {
+        let (crawler, _) = match lock.as_ref() {
             None => return Json(Status{
                 running: false,
+                ..Default::default()
             }),
             Some(crawler) => crawler,
         };
         return Json(Status{
             running: true,
+            auto_sample: Some(crawler.auto_sample()),
         });
+    }
+
+    // Set the var
+    async fn set_var_handler(State(app): State<App>, extract::Path(var): extract::Path<String>, extract::Json(value): extract::Json<Value>) -> impl IntoResponse {
+        match var.as_str() {
+            "auto_sample" => { // Enable or disable the auto sample
+                let lock = app.inner.crawler.lock().unwrap();
+                let (crawler, _) = match lock.as_ref() {
+                    None => return Json(json!({
+                        "error": "DHT not started"
+                    })),
+                    Some(val) => val,
+                };
+                let enable = match value.as_bool() {
+                    None => return Json(json!({
+                        "error": "Invalid value, expected a boolean"
+                    })),
+                    Some(val) => val,
+                };
+
+                let prev = crawler.set_auto_sample(enable);
+                return Json(json!({
+                    "previous": prev,
+                    "current": enable,
+                }));
+            }
+            _ => {
+                return Json(json!({
+                    "error": format!("Unknown var {var}")
+                }));
+            }
+        }
     }
 
     // Info Query

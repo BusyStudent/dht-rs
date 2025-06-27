@@ -31,6 +31,7 @@ struct CrawlerInner {
     // State
     hash_lru: Mutex<LruCache<InfoHash, ()> >,
     auto_sample: AtomicBool,
+    too_many_hash: AtomicBool,
 }
 
 /// The cralwer is responsible for collect info hash and download metadata
@@ -81,6 +82,7 @@ impl Crawler {
             dht_session: session.clone(),
             max_concurrent: 20, // 5 may be too small, use 20?
             max_retries: 2,
+            port: config.ip.port(),
         };
 
         let this = Crawler {
@@ -93,8 +95,9 @@ impl Crawler {
                 sampler: Sampler::new(session.clone()),
                 controller: config.controller,
 
-                auto_sample: AtomicBool::new(false),
                 hash_lru: Mutex::new(LruCache::new(config.hash_lru_cache_size)),
+                auto_sample: AtomicBool::new(false),
+                too_many_hash: AtomicBool::new(false),
             }),
         };
 
@@ -145,15 +148,20 @@ impl Crawler {
     pub fn dht_session(&self) -> &DhtSession {
         return &self.inner.dht_session;
     }
-    
+
+    /// Get the auto sample is enabled or not
+    pub fn auto_sample(&self) -> bool {
+        return self.inner.auto_sample.load(Ordering::Relaxed);
+    }
+
     /// Add a info hash to the crawler, let the crawler find the peers and download the metadata
     pub fn add_hash(&self, info_hash: InfoHash) {
         return self.inner.peer_finder.add_hash(info_hash);
     }
 
-    /// Enable or disable the auto sample
-    pub fn set_auto_sample(&self, enable: bool) {
-        self.inner.auto_sample.store(enable, Ordering::Relaxed);
+    /// Enable or disable the auto sample, return the previous value
+    pub fn set_auto_sample(&self, enable: bool) -> bool {
+        return self.inner.auto_sample.swap(enable, Ordering::Relaxed);
     }
 
     /// Start the crawler
@@ -193,6 +201,18 @@ impl PeerFinderController for CrawlerInner {
             }
         }
     }
+
+    fn on_tasks_count_changed(&self, count: usize) {
+        let new = match count {
+            c if c > 100 => true,
+            c if c < 20 => false,
+            _ => return, // Middle, do nothing
+        };
+        let old = self.too_many_hash.swap(new, Ordering::Relaxed);
+        if old != new {
+            info!("Too many hash, auto sample is {new}");
+        }
+    }
 }
 
 #[async_trait]
@@ -202,7 +222,8 @@ impl DhtSessionObserver for CrawlerInner {
         if self.controller.has_metadata(hash) { // Already has the metadata
             return;
         }
-        if self.check_hash_lru(hash) { // Exist in lru cache?
+        if self.check_hash_lru(hash) { // Not Exist in lru cache?
+            self.controller.on_info_hash_found(hash);
             self.peer_finder.add_hash(hash);
         }
         self.downloader.add_peer(hash, ip);
@@ -210,9 +231,13 @@ impl DhtSessionObserver for CrawlerInner {
 
     async fn on_query(&self, _: &[u8], ip: SocketAddr) {
         // Try to sample it?
-        if self.auto_sample.load(Ordering::Relaxed) {
-            self.sampler.add_sample_node(ip);
+        if !self.auto_sample.load(Ordering::Relaxed) {
+            return; // Auto sample is disabled
         }
+        if self.too_many_hash.load(Ordering::Relaxed) {
+            return; // Too many hash, don't sample
+        }
+        self.sampler.add_sample_node(ip);
     }
 }
 
@@ -223,8 +248,9 @@ impl SamplerObserver for CrawlerInner {
             if self.has_metadata(hash) {
                 continue;
             }
-            if self.check_hash_lru(hash) {
-                // New, add to peer finder
+            if self.check_hash_lru(hash) { // Not Exist in lru cache?
+                // New, add to peer finder & notify
+                self.controller.on_info_hash_found(hash);
                 self.peer_finder.add_hash(hash);
             }
         }

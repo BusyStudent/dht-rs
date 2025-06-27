@@ -20,6 +20,7 @@ struct PeerFinderInner {
 
     // Config
     max_retries: usize,
+    port: u16,
 }
 
 #[derive(Clone)]
@@ -31,21 +32,33 @@ pub struct PeerFinderConfig {
     pub dht_session: DhtSession,
     pub max_concurrent: usize,
     pub max_retries: usize,
+    pub port: u16, // The local port we use to listen for incoming connections
 }
 
 pub trait PeerFinderController {
     fn on_peers_found(&self, hash: InfoHash, peers: Vec<SocketAddr>);
+
+    // Called when the number of pending tasks changed, don't call any peer finder methods in this callback
+    fn on_tasks_count_changed(&self, count: usize);
 }
 
 impl PeerFinder {
+    fn notify_tasks_count_changed(&self, count: usize) {
+        if let Some(controller) = self.inner.controller.wait().upgrade() {
+            controller.on_tasks_count_changed(count);
+        }
+    }
+
     pub fn new(config: PeerFinderConfig) -> Self {
         return Self {
             inner: Arc::new(PeerFinderInner {
                 dht_session: config.dht_session,
                 pending: Mutex::new(BTreeMap::new()),
                 sem: Semaphore::new(config.max_concurrent),
-                max_retries: config.max_retries,
                 controller: OnceLock::new(),
+
+                max_retries: config.max_retries,
+                port: config.port,
             }),
         };
     }
@@ -55,6 +68,8 @@ impl PeerFinder {
         let mut map = self.inner.pending.lock().unwrap();
         if let Some(handle) = map.remove(&info_hash) {
             info!("Canceling peer finding task for {}, {} left", info_hash, map.len());
+            
+            self.notify_tasks_count_changed(map.len());
             handle.abort();
         }
     }
@@ -71,7 +86,9 @@ impl PeerFinder {
             return;
         }
         let handle = tokio::spawn(self.clone().find_peers(info_hash));
+        
         map.insert(info_hash, handle);
+        self.notify_tasks_count_changed(map.len());
     }
 
     async fn find_peers(self, hash: InfoHash) {
@@ -105,7 +122,10 @@ impl PeerFinder {
             time::sleep(time::Duration::from_secs(15 * 60)).await;
         }
         // Remove the task from the pending map
-        self.inner.pending.lock().unwrap().remove(&hash);
+        let mut map = self.inner.pending.lock().unwrap();
+       
+        map.remove(&hash);
+        self.notify_tasks_count_changed(map.len());
     }
 }
 

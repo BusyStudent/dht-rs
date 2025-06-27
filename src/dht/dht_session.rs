@@ -110,9 +110,9 @@ impl DhtSession {
         return self.inner.routing_table.lock().expect("Mutex poisoned");
     }
 
-    pub fn new(id: NodeId, krpc: KrpcContext) -> DhtSession {
+    pub fn new(id: NodeId, krpc: KrpcContext) -> Self {
         let ipv4 = krpc.is_ipv4();
-        return DhtSession {
+        return Self {
             inner: Arc::new(
                 DhtSessionInner {
                     routing_table: Mutex::new(RoutingTable::new(id)),
@@ -634,9 +634,8 @@ impl DhtSession {
             }
             while let Some((id, ip, duration)) = self.routing_table_mut().next_refresh_node(MIN_REFRESH_INTERVAL) {
                 debug!("Refreshing node {} at {}, last seen in {:?}", id, ip, duration);
-                let query = FindNodeQuery {
-                    id: self.inner.id,
-                    target: NodeId::rand(),
+                let query = PingQuery {
+                    id: self.inner.id
                 };
                 ping_set.spawn(self.clone().do_krpc(query, id, ip));
             }
