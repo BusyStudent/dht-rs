@@ -109,8 +109,14 @@ pub struct BtStream<T> {
 
 #[derive(Debug, Error)]
 pub enum BtError {
-    #[error("Failed to handshake, because of the wrong message format")]
-    HandshakeFailed,
+    #[error("Failed to do the extension handshake")]
+    ExtHanshakeFailed,
+
+    #[error("Failed to handshake, because of the wrong protocol string")]
+    InvalidProtocolString,
+
+    #[error("Failed to handshake, because of the hanshake request infohash mismatch")]
+    InfoHashMismatch(InfoHash),
 
     #[error("We received an invalid message")]
     InvalidMessage,
@@ -170,7 +176,7 @@ mod utils {
         // Check headers
         let mut cursor = &buffer[..];
         if cursor[0] as usize != BT_PROTOCOL_LEN ||  &cursor[1..BT_PROTOCOL_LEN + 1] != BT_PROTOCOL_STR {
-            return Err(BtError::HandshakeFailed);
+            return Err(BtError::InvalidProtocolString);
         }
         cursor = &cursor[BT_PROTOCOL_LEN + 1..];
 
@@ -393,12 +399,12 @@ impl BtMessage {
     pub fn decode(bytes: &[u8]) -> Result<BtMessage, BtError> {
         // Header u32(len, contains this id) + u8(id)
         if bytes.len() < 5 { // Al least 5
-            return Err(BtError::HandshakeFailed);
+            return Err(BtError::InvalidMessage);
         }
         let len = u32::from_be_bytes(bytes[0..4].try_into().unwrap());
         let id: BtMessageId = bytes[4].try_into()?;
 
-        if len < 1{
+        if len < 1 {
             return Err(BtError::InvalidMessage);
         }
         if len > MAX_MESSAGE_LEN { // 50MB, too large
@@ -477,11 +483,11 @@ impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
             match in_msg {
                 BtMessage::Extended { id, msg, payload } => {
                     if id != 0 || !payload.is_empty() {
-                        return Err(BtError::HandshakeFailed);
+                        return Err(BtError::ExtHanshakeFailed);
                     }
                     Some(msg)
                 },
-                _ => return Err(BtError::HandshakeFailed),
+                _ => return Err(BtError::ExtHanshakeFailed),
             }
         }
         else {
@@ -508,7 +514,7 @@ impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
         utils::write_handshake(&mut stream, &info).await?;
         let request = utils::read_handshake(&mut stream).await?;
         if request.hash != info.hash { // Info Hash mismatch
-            return Err(BtError::HandshakeFailed);
+            return Err(BtError::InfoHashMismatch(request.hash));
         }
         return BtStream::build(stream, request, info).await;
     }

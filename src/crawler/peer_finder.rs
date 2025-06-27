@@ -91,22 +91,11 @@ impl PeerFinder {
         self.notify_tasks_count_changed(map.len());
     }
 
-    async fn find_peers(self, hash: InfoHash) {
-        for _ in 0..self.inner.max_retries {
-            let premit = match self.inner.sem.acquire().await {
-                Ok(p) => p,
-                Err(_) => return, // May not happend
-            };
-            info!("Finding peers for {}", hash);
-            if let Ok(result) = self.inner.dht_session.clone().get_peers(hash).await {
-                info!("Found {} peers for {}", result.peers.len(), hash);
-                // Call the controller for each peer
-                if let Some(controller) = self.inner.controller.wait().upgrade() {
-                    if !result.peers.is_empty() {
-                        controller.on_peers_found(hash, result.peers);
-                    }
-                }
-                
+    async fn find_peers_on_dht(&self, hash: InfoHash) -> Vec<SocketAddr> {
+        if let Ok(result) = self.inner.dht_session.clone().get_peers(hash).await {
+            info!("Found {} peers for {} on DHT", result.peers.len(), hash);
+            // If peers it not enough, announce the peers
+            if result.peers.len() < 50 {
                 // Begin announcing the peers
                 let mut set = JoinSet::new();
                 for node in result.nodes {
@@ -116,6 +105,26 @@ impl PeerFinder {
                 }
                 let _ = set.join_all().await;
             }
+            return result.peers;
+        }
+        return Vec::new();
+    }
+
+    async fn find_peers(self, hash: InfoHash) {
+        for _ in 0..self.inner.max_retries {
+            let premit = match self.inner.sem.acquire().await {
+                Ok(p) => p,
+                Err(_) => return, // May not happend
+            };
+            info!("Finding peers for {}", hash);
+            // 1. Find peers on dht
+            let peers = self.find_peers_on_dht(hash).await;
+            if let Some(controller) = self.inner.controller.wait().upgrade() {
+                if !peers.is_empty() {
+                    controller.on_peers_found(hash, peers);
+                }
+            }
+
             drop(premit);
             info!("Finished finding peers for {}, sleeping for 15 minutes", hash);
             // Next find_peers in 15 minutes

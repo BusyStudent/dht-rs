@@ -7,7 +7,7 @@ use crate::bencode::Object;
 use sha1::Digest;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
@@ -34,12 +34,14 @@ struct DownloaderInner {
     cancel_watch: OnceLock<watch::Receiver<bool> >,
     utp_context: UtpContext,
     peer_id: PeerId,
+    bind_ip: SocketAddr,
 }
 
-// pub struct DownloaderConfig {
-//     utp_context: UtpContext,
-//     peer_id: PeerId,
-// }
+pub struct DownloaderConfig {
+    pub utp_context: UtpContext,
+    pub peer_id: PeerId,
+    pub bind_ip: SocketAddr,
+}
 
 pub trait DownloaderController {
     fn on_metadata_downloaded(&self, info_hash: InfoHash, data: Vec<u8>);
@@ -58,14 +60,15 @@ struct CancelGuard {
 
 impl Downloader {
     // Create an downloader
-    pub fn new(ctxt: UtpContext, id: PeerId) -> Self {
+    pub fn new(config: DownloaderConfig) -> Self {
         let downloader = Self { inner: Arc::new(DownloaderInner {
             workers: Mutex::new(HashMap::new()),
             controller: OnceLock::new(),
             sem: Semaphore::new(MAX_WORKERS),
             cancel_watch: OnceLock::new(),
-            utp_context: ctxt,
-            peer_id: id,
+            utp_context: config.utp_context,
+            peer_id: config.peer_id,
+            bind_ip: config.bind_ip,
         })};
         return downloader;
     }
@@ -77,7 +80,7 @@ impl Downloader {
         self.inner.cancel_watch.set(rx).unwrap(); // Set the cancel watch for the worker
 
         // Begin Listen
-        self.listener_main().await;
+        tokio::join!(self.utp_listener_main(), self.tcp_listener_main() );
     }
 
     fn make_handshake_info(&self, hash: InfoHash) -> BtHandshakeInfo {
@@ -91,19 +94,37 @@ impl Downloader {
         }
     }
 
-    async fn listener_main(&self) {
+    async fn utp_listener_main(&self) {
         let mut listener = UtpListener::new(&self.inner.utp_context, 10); // MAX 10 pending.
         loop {
-            let (stream, _peer) = match listener.accept().await {
+            let (stream, peer) = match listener.accept().await {
                 Ok(val) => val,
                 Err(e) => {
                     error!("Failed to use UtpListener::accept() => {e}");
                     return;
                 }
             };
-            info!("Utp: Incoming peer {:?}", stream);
+            tokio::spawn(self.clone().handle_incoming(stream, peer));
+        }
+    }
 
-            tokio::spawn(self.clone().handle_incoming(stream));
+    async fn tcp_listener_main(&self) {
+        let listener = match TcpListener::bind(&self.inner.bind_ip).await {
+            Ok(val) => val,
+            Err(e) => {
+                error!("Failed to use TcpListener::bind() => {e}");
+                return;
+            }
+        };
+        loop {
+            let (stream, peer) = match listener.accept().await {
+                Ok(val) => val,
+                Err(e) => {
+                    error!("Failed to use TcpListener::accept() => {e}");
+                    return;
+                }
+            };
+            tokio::spawn(self.clone().handle_incoming(stream, peer));
         }
     }
 
@@ -202,6 +223,13 @@ impl Downloader {
                         }
                         break payload;
                     }
+                    UtMetadataMessage::Reject { piece } => {
+                        if piece != i {
+                            error!("Got wrong piece {piece}");
+                            return Err(BtError::InvalidMessage);
+                        }
+                        return Err(BtError::UserDefined("Peer reject too many times".into()));
+                    }
                     _ => {
                         error!("Got wrong message {ut_msg:?}");
                         return Err(BtError::InvalidMessage);
@@ -234,7 +262,7 @@ impl Downloader {
         return Self::download_impl(stream, hash).await;
     }
 
-    async fn handle_incoming_impl<T: AsyncRead + AsyncWrite + Unpin>(&self, stream: T) -> Result<(), BtError> {
+    async fn handle_incoming_impl<T: AsyncRead + AsyncWrite + Unpin>(&self, stream: T) -> Result<InfoHash, BtError> {
         let controller = match self.inner.controller.wait().upgrade() {
             Some(val) => val,
             None => {
@@ -247,7 +275,7 @@ impl Downloader {
             info!("Handshake request: for hash {}", req.hash);
             if controller.has_metadata(req.hash) {
                 info!("Already have metadata for {}", req.hash);
-                return Err(BtError::HandshakeFailed);
+                return Err(BtError::UserDefined("Already have metadata".into()));
             }
             let info = this.make_handshake_info(req.hash);
             return Ok(info);
@@ -264,15 +292,17 @@ impl Downloader {
         if let Some(controller) = self.inner.controller.wait().upgrade() {
             controller.on_metadata_downloaded(hash, torrent);
         }
-        return Ok(());
+        return Ok(hash);
 
     }
 
-    async fn handle_incoming<T: AsyncRead + AsyncWrite + Unpin>(self, stream: T) {
+    async fn handle_incoming<T: AsyncRead + AsyncWrite + Unpin>(self, stream: T, peer: SocketAddr) {
         match self.handle_incoming_impl(stream).await {
-            Ok(_) => {}
-            Err(_) => {
-                
+            Ok(_) => {
+                info!("Successfully downloaded metadata from peer: {peer}");
+            }
+            Err(err) => {
+                info!("Failed to get any metadata from peer: {peer} error: {err}");
             }
         }
         return;

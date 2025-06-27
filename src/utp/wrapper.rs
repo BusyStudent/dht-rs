@@ -3,7 +3,8 @@
 use super::addr::*;
 use super::ffi::*;
 use libc::{c_int, c_void, size_t};
-use tracing::info;
+use tracing::warn;
+// use tracing::info;
 use std::fmt;
 use std::sync::Weak;
 use std::{
@@ -208,11 +209,15 @@ impl UtpContextInner {
                 if let Some(sock) = UtpContextInner::get_socket(args) {
                     sock.on_read(data);
                 }
+                else { // Probably in the accept
+                    warn!("UtpSocket {:?} read but no socket bind, data maybe lost", args.socket);
+                }
                 return 0;
             }
 
             // Listener...
             UTP_CALLBACK::ON_ACCEPT => {
+                // FIXME: Race condition, the data may be lost if it arrive before the accept
                 let sock = args.socket;
                 if let Some(send) = self.sock_send.lock().unwrap().as_ref() {
                     if send.try_send(utp_socket_t(sock)).is_ok() {
@@ -303,7 +308,7 @@ impl UtpSocket {
     pub async fn connect(ctxt: &UtpContext, addr: SocketAddr) -> io::Result<UtpSocket> {
         let sock = UtpSocket::new(ctxt);
         unsafe {
-            info!("UtpSocket {:?} connecting to {}", sock.inner.utp_socket, addr);
+            // info!("UtpSocket {:?} connecting to {}", sock.inner.utp_socket, addr);
             let os_addr = rs_addr_to_c(&addr);
             let (addr, len) = os_addr.to_ptr_len();
             let ret = utp_connect(sock.inner.utp_socket.get(), addr, len);
@@ -320,7 +325,7 @@ impl UtpSocket {
 impl UtpSocketInner {
     fn on_state_change(&self, state: UTP_STATE) {
         let mut this = self.state.lock().unwrap();
-        info!("UtpSocket {:?} state changed to {:?}", self.utp_socket, state);
+        // info!("UtpSocket {:?} state changed to {:?}", self.utp_socket, state);
         match state {
             UTP_STATE::WRITABLE | UTP_STATE::CONNECT => {
                 // On connect or writeable, we can write
@@ -347,7 +352,7 @@ impl UtpSocketInner {
     }
 
     fn on_error(&self, error: UTP_ERROR) {
-        info!("UtpSocket {:?} into error, code: {:?}", self.utp_socket, error);
+        // info!("UtpSocket {:?} into error, code: {:?}", self.utp_socket, error);
         let mut this = self.state.lock().unwrap();
         this.error_code = Some(error);
 
@@ -361,7 +366,7 @@ impl UtpSocketInner {
     }
 
     fn on_read(&self, data: &[u8]) {
-        info!("UtpSocket {:?} into readable, {} bytes can read", self.utp_socket, data.len());
+        // info!("UtpSocket {:?} into readable, {} bytes can read", self.utp_socket, data.len());
         let mut this = self.state.lock().unwrap();
         this.read_buf.extend(data);
 
@@ -421,7 +426,7 @@ impl AsyncRead for UtpSocket {
             let total = len1 + len2;
             this.read_buf.drain(..total);
 
-            info!("UtpSocket {:?} read {} bytes {} bytes left", self.inner.utp_socket, total, this.read_buf.len());
+            // info!("UtpSocket {:?} read {} bytes {} bytes left", self.inner.utp_socket, total, this.read_buf.len());
             return Poll::Ready(Ok(()));
         }
         if this.eof {
@@ -429,7 +434,7 @@ impl AsyncRead for UtpSocket {
         }
 
         // Save until we have data
-        info!("UtpSocket {:?} now is not readable, waiting for data", self.inner.utp_socket);
+        // info!("UtpSocket {:?} now is not readable, waiting for data", self.inner.utp_socket);
         this.read_waker = Some(cx.waker().clone());
         return Poll::Pending;
     }
@@ -471,7 +476,7 @@ impl AsyncWrite for UtpSocket {
         }
 
         // No longer writable we need to suspend self
-        info!("UtpSocket {:?} now is not writable, waiting for writable", self.inner.utp_socket);
+        // info!("UtpSocket {:?} now is not writable, waiting for writable", self.inner.utp_socket);
         this.write_waker = Some(cx.waker().clone());
         return Poll::Pending;
     }
@@ -546,7 +551,7 @@ impl fmt::Debug for UtpSocket {
 impl Drop for UtpSocket {
     fn drop(&mut self) {
         unsafe {
-            info!("{:?} is dropped", self);
+            // info!("{:?} is dropped", self);
             let _lock = self.ctxt.utp_ctxt.lock().unwrap(); // We need to lock the context to close the socket
             utp_set_userdata(self.inner.utp_socket.get(), std::ptr::null_mut()); // Clear the inner we bind
             utp_close(self.inner.utp_socket.get());

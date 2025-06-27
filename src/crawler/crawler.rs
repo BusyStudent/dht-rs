@@ -3,7 +3,7 @@
 use crate::{
     bt::*,
     crawler::{
-        downloader::{Downloader, DownloaderController},
+        downloader::{Downloader, DownloaderConfig, DownloaderController},
         peer_finder::{PeerFinder, PeerFinderConfig, PeerFinderController}, sampler::{Sampler, SamplerObserver},
     },
     dht::*,
@@ -85,12 +85,18 @@ impl Crawler {
             port: config.ip.port(),
         };
 
+        let downloader_config = DownloaderConfig {
+            utp_context: utp.clone(),
+            peer_id: id,
+            bind_ip: config.ip,
+        };
+
         let this = Crawler {
             inner: Arc::new(CrawlerInner {
                 udp: udp,
                 dht_session: session.clone(),
-                utp_context: utp.clone(),
-                downloader: Downloader::new(utp, id),
+                utp_context: utp,
+                downloader: Downloader::new(downloader_config),
                 peer_finder: PeerFinder::new(finder_config),
                 sampler: Sampler::new(session.clone()),
                 controller: config.controller,
