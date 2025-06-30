@@ -104,7 +104,7 @@ impl Downloader {
                     return;
                 }
             };
-            tokio::spawn(self.clone().handle_incoming(stream, peer));
+            tokio::spawn(self.clone().handle_incoming("Utp", stream, peer));
         }
     }
 
@@ -124,7 +124,7 @@ impl Downloader {
                     return;
                 }
             };
-            tokio::spawn(self.clone().handle_incoming(stream, peer));
+            tokio::spawn(self.clone().handle_incoming("Tcp", stream, peer));
         }
     }
 
@@ -296,13 +296,16 @@ impl Downloader {
 
     }
 
-    async fn handle_incoming<T: AsyncRead + AsyncWrite + Unpin>(self, stream: T, peer: SocketAddr) {
+    async fn handle_incoming<T: AsyncRead + AsyncWrite + Unpin>(self, proto: &'static str, stream: T, peer: SocketAddr) {
         match self.handle_incoming_impl(stream).await {
             Ok(_) => {
-                info!("Successfully downloaded metadata from peer: {peer}");
+                info!("{proto}: Successfully downloaded metadata from peer: {peer}");
             }
-            Err(err) => {
-                info!("Failed to get any metadata from peer: {peer} error: {err}");
+            Err(BtError::InvalidProtocolString) => {
+                warn!("{proto}: Invalid protocol string from peer: {peer}");
+            }
+            Err(err) => { // Another error
+                info!("{proto}: Failed to get any metadata from peer: {peer} error: {err}");
             }
         }
         return;

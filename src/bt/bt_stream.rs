@@ -138,6 +138,8 @@ pub enum BtError {
 }
 
 mod utils {
+    use tracing::warn;
+
     use super::*;
 
     /// Helper function to write the common handshake info
@@ -176,6 +178,8 @@ mod utils {
         // Check headers
         let mut cursor = &buffer[..];
         if cursor[0] as usize != BT_PROTOCOL_LEN ||  &cursor[1..BT_PROTOCOL_LEN + 1] != BT_PROTOCOL_STR {
+            // Dump it
+            warn!("Invalid protocol string: len: {} str: {:?}", cursor[0], &cursor[1..BT_PROTOCOL_LEN + 1]);
             return Err(BtError::InvalidProtocolString);
         }
         cursor = &cursor[BT_PROTOCOL_LEN + 1..];
@@ -544,7 +548,8 @@ impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
 
 #[cfg(test)]
 mod tests {
-    use crate::{bt::UtMetadataMessage, utp::{UtpContext, UtpSocket} };
+    #![allow(unused_imports)]
+    use crate::{bt::{PeStream, UtMetadataMessage}, utp::{UtpContext, UtpSocket} };
 
     use super::*;
     use tracing::error;
@@ -584,6 +589,10 @@ mod tests {
                 ])
             )
         };
+
+        // Test Use PE?
+        let stream = PeStream::client_handshake(stream, info.hash).await.unwrap();
+
         // TODO:_
         let mut bt_stream = BtStream::client_handshake(stream, info).await?;
         let metadata_size = match bt_stream.peer_info().metadata_size() {

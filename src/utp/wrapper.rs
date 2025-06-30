@@ -23,7 +23,7 @@ use tokio::{
     sync::mpsc,
 };
 
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 #[derive(Debug, Clone, Copy)]
 struct utp_context_t(*mut utp_context);
@@ -35,7 +35,7 @@ struct utp_socket_t(*mut utp_socket);
 struct UtpContextInner {
     utp_ctxt: Mutex<utp_context_t>, // The UTP context is not thread safe, so we need to lock it
     udp_send: mpsc::Sender<(Vec<u8>, SocketAddr)>,
-    sock_send: Mutex<Option<mpsc::Sender<utp_socket_t> > >, // The socket send channel, for accept new socket
+    sock_send: Mutex<Option<mpsc::Sender<Box<UtpSocketInner> > > >, // The socket send channel, for accept new socket
 }
 
 #[derive(Default)]
@@ -70,7 +70,7 @@ pub struct UtpSocket {
 
 pub struct UtpListener {
     ctxt: Arc<UtpContextInner>,
-    receiver: mpsc::Receiver<utp_socket_t>,
+    receiver: mpsc::Receiver<Box<UtpSocketInner> >,
 }
 
 impl UtpContext {
@@ -210,22 +210,26 @@ impl UtpContextInner {
                     sock.on_read(data);
                 }
                 else { // Probably in the accept
-                    warn!("UtpSocket {:?} read but no socket bind, data maybe lost", args.socket);
+                    warn!("UtpSocket {:?} on read but no socket bind, data maybe lost", args.socket);
                 }
                 return 0;
             }
 
             // Listener...
             UTP_CALLBACK::ON_ACCEPT => {
-                // FIXME: Race condition, the data may be lost if it arrive before the accept
-                let sock = args.socket;
+                let socket = args.socket;
                 if let Some(send) = self.sock_send.lock().unwrap().as_ref() {
-                    if send.try_send(utp_socket_t(sock)).is_ok() {
-                        return 0;
+                    // Wrap the socket, bind the buffer to avoid the data lost, if it arrive before the UtpListener::accept
+                    let sock = unsafe { UtpSocketInner::new(utp_socket_t(socket)) };
+                    if let Err(e) = send.try_send(sock) {
+                        // The queue is full or broken, close the socket
+                        unsafe { close_utp_socket(e.into_inner().utp_socket); }
                     }
                 }
-                // The queue is full, we need to close the socket
-                unsafe { utp_close(sock) };
+                else {
+                    // No sender bind, close the socket
+                    unsafe { utp_close(socket) };
+                }
                 return 0;
             }
             _ => {
@@ -254,32 +258,11 @@ impl UtpSocket {
             let utp_socket = utp_create_socket(utp_ctxt.get());
             assert!(!utp_socket.is_null());
 
-            return UtpSocket::from(ctxt.inner.clone(), utp_socket_t(utp_socket));
+            return UtpSocket {
+                ctxt: ctxt.inner.clone(),
+                inner: UtpSocketInner::new(utp_socket_t(utp_socket)),
+            }
         }
-    }
-
-    /// Build an UtpSocket from the raw pointer
-    fn from(ctxt: Arc<UtpContextInner>, utp_socket: utp_socket_t) -> UtpSocket {
-        let inner = unsafe {
-            // We need bind it
-            let inner = Box::new(UtpSocketInner {
-                utp_socket: utp_socket,
-                state: Mutex::new(UtpSocketState {
-                    eof: false,
-                    connected: false,
-                    read_buf: VecDeque::new(),
-                    ..Default::default()
-                }),
-            });
-            let ptr = inner.as_ref() as *const UtpSocketInner;
-            utp_set_userdata(utp_socket.get(), ptr as *mut c_void);
-
-            inner
-        };
-        return UtpSocket {
-            ctxt: ctxt,
-            inner: inner,
-        };
     }
 
     /// Get the context of the socket
@@ -308,7 +291,7 @@ impl UtpSocket {
     pub async fn connect(ctxt: &UtpContext, addr: SocketAddr) -> io::Result<UtpSocket> {
         let sock = UtpSocket::new(ctxt);
         unsafe {
-            // info!("UtpSocket {:?} connecting to {}", sock.inner.utp_socket, addr);
+            trace!("UtpSocket {:?} connecting to {}", sock.inner.utp_socket, addr);
             let os_addr = rs_addr_to_c(&addr);
             let (addr, len) = os_addr.to_ptr_len();
             let ret = utp_connect(sock.inner.utp_socket.get(), addr, len);
@@ -323,9 +306,32 @@ impl UtpSocket {
 }
 
 impl UtpSocketInner {
+    /// Build the utp socket inner from the raw pointer, and bind the user data
+    ///
+    /// NOTE: You should unbind the user data when you drop the socket
+    unsafe fn new(utp_socket: utp_socket_t) -> Box<UtpSocketInner> {
+        debug_assert!(!utp_socket.get().is_null(), "WTF, utp_socket is null");
+        unsafe {
+            // We need bind it
+            let inner = Box::new(UtpSocketInner {
+                utp_socket: utp_socket,
+                state: Mutex::new(UtpSocketState {
+                    eof: false,
+                    connected: false,
+                    read_buf: VecDeque::new(),
+                    ..Default::default()
+                }),
+            });
+            let ptr = inner.as_ref() as *const UtpSocketInner;
+            utp_set_userdata(utp_socket.get(), ptr as *mut c_void);
+
+            return inner;
+        }
+    }
+
     fn on_state_change(&self, state: UTP_STATE) {
         let mut this = self.state.lock().unwrap();
-        // info!("UtpSocket {:?} state changed to {:?}", self.utp_socket, state);
+        trace!("UtpSocket {:?} state changed to {:?}", self.utp_socket, state);
         match state {
             UTP_STATE::WRITABLE | UTP_STATE::CONNECT => {
                 // On connect or writeable, we can write
@@ -352,7 +358,7 @@ impl UtpSocketInner {
     }
 
     fn on_error(&self, error: UTP_ERROR) {
-        // info!("UtpSocket {:?} into error, code: {:?}", self.utp_socket, error);
+        trace!("UtpSocket {:?} into error, code: {:?}", self.utp_socket, error);
         let mut this = self.state.lock().unwrap();
         this.error_code = Some(error);
 
@@ -366,7 +372,7 @@ impl UtpSocketInner {
     }
 
     fn on_read(&self, data: &[u8]) {
-        // info!("UtpSocket {:?} into readable, {} bytes can read", self.utp_socket, data.len());
+        trace!("UtpSocket {:?} into readable, {} bytes can read", self.utp_socket, data.len());
         let mut this = self.state.lock().unwrap();
         this.read_buf.extend(data);
 
@@ -426,7 +432,7 @@ impl AsyncRead for UtpSocket {
             let total = len1 + len2;
             this.read_buf.drain(..total);
 
-            // info!("UtpSocket {:?} read {} bytes {} bytes left", self.inner.utp_socket, total, this.read_buf.len());
+            trace!("UtpSocket {:?} read {} bytes {} bytes left", self.inner.utp_socket, total, this.read_buf.len());
             return Poll::Ready(Ok(()));
         }
         if this.eof {
@@ -434,7 +440,7 @@ impl AsyncRead for UtpSocket {
         }
 
         // Save until we have data
-        // info!("UtpSocket {:?} now is not readable, waiting for data", self.inner.utp_socket);
+        trace!("UtpSocket {:?} now is not readable, waiting for data", self.inner.utp_socket);
         this.read_waker = Some(cx.waker().clone());
         return Poll::Pending;
     }
@@ -476,7 +482,7 @@ impl AsyncWrite for UtpSocket {
         }
 
         // No longer writable we need to suspend self
-        // info!("UtpSocket {:?} now is not writable, waiting for writable", self.inner.utp_socket);
+        trace!("UtpSocket {:?} now is not writable, waiting for writable", self.inner.utp_socket);
         this.write_waker = Some(cx.waker().clone());
         return Poll::Pending;
     }
@@ -523,7 +529,10 @@ impl UtpListener {
                 ))
             }
         };
-        let sock = UtpSocket::from(self.ctxt.clone(), sock);
+        let sock = UtpSocket {
+            ctxt: self.ctxt.clone(),
+            inner: sock,
+        };
         let addr = match sock.peer_addr() {
             Some(addr) => addr,
             None => {
@@ -539,6 +548,14 @@ impl UtpListener {
     }
 }
 
+/// Close the socket, and clear the inner bind
+unsafe fn close_utp_socket(sock: utp_socket_t) {
+    unsafe {
+        utp_set_userdata(sock.get(), std::ptr::null_mut());
+        utp_close(sock.get());
+    }
+}
+
 impl fmt::Debug for UtpSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.peer_addr() {
@@ -551,10 +568,9 @@ impl fmt::Debug for UtpSocket {
 impl Drop for UtpSocket {
     fn drop(&mut self) {
         unsafe {
-            // info!("{:?} is dropped", self);
+            trace!("{:?} is dropped", self);
             let _lock = self.ctxt.utp_ctxt.lock().unwrap(); // We need to lock the context to close the socket
-            utp_set_userdata(self.inner.utp_socket.get(), std::ptr::null_mut()); // Clear the inner we bind
-            utp_close(self.inner.utp_socket.get());
+            close_utp_socket(self.inner.utp_socket);
         }
     }
 }
@@ -568,7 +584,7 @@ impl Drop for UtpListener {
             // Close all socket in channel
             loop {
                 match self.receiver.try_recv() {
-                    Ok(sock) => utp_close(sock.get()),
+                    Ok(sock) => close_utp_socket(sock.utp_socket),
                     Err(_) => break,
                 }
             }
