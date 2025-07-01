@@ -609,7 +609,7 @@ impl DhtSession {
             // Emm, we have no nodes in the routing table, let run retry
             return false;
         }
-        while len <= 50 && iter < 10 { // Doing random search to fill our bucket
+        while len <= 20 && iter < 10 { // Doing random search to fill our bucket
             let id = NodeId::rand();
             let nodes = self.routing_table_mut().find_node(id);
             if nodes.is_empty() {

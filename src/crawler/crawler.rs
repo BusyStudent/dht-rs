@@ -16,7 +16,7 @@ use std::{
 };
 use async_trait::async_trait;
 use tokio::{net::UdpSocket, sync::{Semaphore, mpsc}, task::JoinSet};
-use tracing::{error, info};
+use tracing::{error, info, warn, trace};
 use lru::LruCache;
 
 struct CrawlerInner {
@@ -45,6 +45,7 @@ pub struct CrawlerConfig {
     pub ip: SocketAddr, // Bind addr
     pub hash_lru_cache_size: NonZero<usize>,
     pub controller: Arc<dyn CrawlerController + Send + Sync>,
+    pub trackers: Vec<String>,
 }
 
 pub trait CrawlerController {
@@ -80,9 +81,11 @@ impl Crawler {
 
         let finder_config = PeerFinderConfig {
             dht_session: session.clone(),
+            udp_socket: udp.clone(),
             max_concurrent: 20, // 5 may be too small, use 20?
             max_retries: 2,
-            port: config.ip.port(),
+            bind_ip: config.ip,
+            peer_id: id,
         };
 
         let downloader_config = DownloaderConfig {
@@ -121,6 +124,9 @@ impl Crawler {
         // Set the observer for sampler
         let weak = Arc::downgrade(&this.inner);
         this.inner.sampler.set_observer(weak);
+        
+        // Add Udp Tracker
+        this.inner.peer_finder.add_trackers(config.trackers).await;
 
         return Ok(this);
     }
@@ -142,11 +148,25 @@ impl Crawler {
                 if self.inner.dht_session.process_udp(&buf[..n], &addr).await { // Successfully process it
                     continue;
                 }
-                // Try utp?
             }
+            // Check is Udp Trakcer?
+            if n >= 8 {
+                // u32: action
+                // u32: transaction id
+                // payload...
+                let action = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+                if action < 4 { // Connect(0) ... Announce(3)
+                    if self.inner.peer_finder.process_udp(&buf[..n], &addr) {
+                        continue;
+                    }
+                }
+            }
+
+            // Try utp?
             if self.inner.utp_context.process_udp(&buf[..n], &addr) {
                 continue;
             }
+            trace!("Unknown udp packet from {}: len: {}", addr, n);
         }
     }
 
@@ -210,7 +230,7 @@ impl PeerFinderController for CrawlerInner {
 
     fn on_tasks_count_changed(&self, count: usize) {
         let new = match count {
-            c if c > 100 => true,
+            c if c > 1000 => true,
             c if c < 20 => false,
             _ => return, // Middle, do nothing
         };
@@ -258,6 +278,7 @@ impl SamplerObserver for CrawlerInner {
                 // New, add to peer finder & notify
                 self.controller.on_info_hash_found(hash);
                 self.peer_finder.add_hash(hash);
+                self.downloader.add_hash(hash); // Notify it we may have the incoming peer about this hash
             }
         }
     }

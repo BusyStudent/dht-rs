@@ -8,4 +8,4 @@ pub use bt_stream::{BtStream, BtMessage, BtError, BtHandshakeInfo, PeerId};
 pub use pe_stream::{PeStream, PeError};
 pub use ext_messages::{UtMetadataMessage};
 pub use torrent::Torrent;
-pub use udp_tracker::{TrackerError, AnnounceInfo, AnnounceResult, ScrapedItem, UdpTracker};
+pub use udp_tracker::{TrackerError, AnnounceInfo, AnnounceResult, ScrapedItem, UdpTracker, Event};

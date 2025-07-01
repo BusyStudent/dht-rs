@@ -1,7 +1,9 @@
+// FIXME: It may bug here, the tid mismatch in many times...
 use tokio::net::UdpSocket;
 use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::sync::oneshot;
+use tracing::warn;
 
 use crate::InfoHash;
 use crate::PeerId;
@@ -21,7 +23,7 @@ const PROTOCOL_ID: u64 = 0x41727101980;
 const MAX_SCRAPE: usize = 74;
 
 // Our 
-const MAX_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TIMEOUT: Duration = Duration::from_secs(10);
 
 // Request
 // u32: action
@@ -120,8 +122,8 @@ pub enum TrackerError {
     #[error("Request Timed out")]
     TimedOut,
 
-    // #[error("Network error: {0}")]
-    // NetworkError(#[from] io::Error)
+    #[error("Network error: {0}")]
+    NetworkError(String) // The io::Error is not cloneable :(, use String to store the message
 }
 
 struct CancelGuard<'a> {
@@ -142,6 +144,11 @@ impl UdpTracker {
                 ..Default::default()
             })
         })};
+    }
+
+    // Get the peer address of the tracker
+    pub fn peer_addr(&self) -> SocketAddr {
+        return self.inner.addr;
     }
 
     // Do a connect request to the tracker and return the connection id
@@ -174,27 +181,28 @@ impl UdpTracker {
 
     // Get the connection id in the tracker, if already haven, return it, if not or expired, do a connect request
     async fn connection_id(&self) -> Result<u64, TrackerError> {
-        let mut state = self.inner.con_state.lock().unwrap();
-        if let Some((id, time)) = state.id {
-            if time.elapsed() < CONNECTION_EXPIRY {
-                return Ok(id);
+        let mut receiver = {
+            let mut state = self.inner.con_state.lock().unwrap();
+            if let Some((id, time)) = state.id {
+                if time.elapsed() < CONNECTION_EXPIRY {
+                    return Ok(id);
+                }
+                state.id = None; // Clear the connection id, it is expired
             }
-            state.id = None; // Clear the connection id, it is expired
-        }
-        // Start one or wait for the connect worker
-        let mut receiver = match state.worker.as_ref() {
-            Some(sender) => sender.subscribe(),
-            None => {
-                let (tx, rx) = broadcast::channel(1);
-                tokio::spawn(self.clone().connect_worker(tx.clone()));
-                state.worker = Some(tx);
+            
+            // Start one or wait for the connect worker
+            match state.worker.as_ref() {
+                Some(sender) => sender.subscribe(),
+                None => {
+                    let (tx, rx) = broadcast::channel(1);
+                    tokio::spawn(self.clone().connect_worker(tx.clone()));
+                    state.worker = Some(tx);
 
-                rx
+                    rx
+                }
             }
         };
         // Wait for the connection id
-        drop(state);
-
         return receiver.recv().await.map_err(|_| TrackerError::TimedOut)?;
     }
 
@@ -222,11 +230,16 @@ impl UdpTracker {
         let (tx, rx) = oneshot::channel();
         let mut guard = CancelGuard::new(tid, &self.inner);
         self.inner.pending.lock().unwrap().insert(tid, tx);
-        self.inner.sockfd.send_to(&buf, &self.inner.addr).await.map_err(|_| TrackerError::Unknown)?; // Emm? why sendto failed, the only error i think is the package too big
+        self.inner.sockfd.send_to(&buf, &self.inner.addr)
+            .await
+            .map_err(|e| TrackerError::NetworkError(e.to_string()) )?;
 
         let (ret_action, data) = match rx.await {
             Ok(val) => val,
-            Err(_) => return Err(TrackerError::Unknown),
+            Err(e) => {
+                warn!("WTF, the sender is dropped? {}", e);
+                return Err(TrackerError::Unknown);
+            },
         };
         // Done, async get the result, now we can remove the guard
         guard.disarm();
@@ -269,7 +282,8 @@ impl UdpTracker {
             let _ = sender.send((action, bytes));
             return true;
         }
-        return false; // Not found
+        warn!("Trakcer for {}, get a reply with unknown tid: {}", self.inner.addr, tid);
+        return true; // Valid packet, belong us, but the tid did not match
     }
 
     // Do the announce request to the tracker and return the list of peers
@@ -314,7 +328,7 @@ impl UdpTracker {
         let left = &bytes[12..];
         let mut peers = Vec::new();
 
-        if left.len() & 6 == 0 { // IPV4
+        if left.len() % 6 == 0 { // IPV4
             for chunk in left.chunks_exact(6) {
                 let ip: [u8; 4] = chunk[0..4].try_into().unwrap();
                 let port: [u8; 2] = chunk[4..6].try_into().unwrap();
@@ -322,7 +336,7 @@ impl UdpTracker {
                 peers.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), u16::from_be_bytes(port)));
             }
         }
-        else if left.len() & 18 == 0 { // IPV6
+        else if left.len() % 18 == 0 { // IPV6
             for chunk in left.chunks_exact(18) {
                 let ip: [u8; 16] = chunk[0..16].try_into().unwrap();
                 let port: [u8; 2] = chunk[16..18].try_into().unwrap();
@@ -378,6 +392,7 @@ impl UdpTracker {
 
 impl<'a> CancelGuard<'a> {
     fn new(tid: u32, tracker: &'a UdpTrackerInner) -> Self {
+        // warn!("Adding pending task: {} on tracker {}", tid, tracker.addr);
         return Self {
             tid: tid,
             tracker: tracker,
@@ -393,6 +408,7 @@ impl<'a> CancelGuard<'a> {
 impl<'a> Drop for CancelGuard<'a> {
     fn drop(&mut self) {
         if !self.disarm { // Cleanup when task was canceled
+            // warn!("Removing pending task: {} on tracker {}", self.tid, self.tracker.addr);
             self.tracker.pending.lock().unwrap().remove(&self.tid);
         }
     }
@@ -432,6 +448,16 @@ mod tests {
         // Ubuntu 25.04
         let hash = InfoHash::from_hex("8a19577fb5f690970ca43a57ff1011ae202244b8").unwrap();
         let items = tracker.scrape(std::slice::from_ref(&hash)).await.unwrap();
+        let _result = tracker.announce(AnnounceInfo {
+            hash: hash,
+            peer_id: PeerId::rand(),
+            port: 11451,
+            uploaded: 0,
+            downloaded: 0,
+            left: 1,
+            event: Event::None,
+            num_want: None,
+        }).await.unwrap();
         info!("Scraped: {items:?}");
         handle.abort();
         let _ = handle.await;

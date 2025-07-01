@@ -34,8 +34,8 @@ pub enum PeError {
     #[error("Failed to handshake")]
     HanshakeFailed,
 
-    #[error("We are not interested in this torrent")]
-    InfoHashMismatch,
+    #[error("We are not find the info hash to decrypt the incoming stream")]
+    InfoHashNotFound,
 
     #[error("Network error: {0}")]
     NetworkError(#[from] io::Error),
@@ -49,8 +49,8 @@ pub struct PeStream<T> {
     init_payload: Vec<u8>,
     
     // Encryption state
-    decryptor: Option<Box<dyn StreamCipher> >,
-    encryptor: Option<Box<dyn StreamCipher> >,
+    decryptor: Option<Box<dyn StreamCipher + Send> >,
+    encryptor: Option<Box<dyn StreamCipher + Send> >,
     encryptor_buf: Vec<u8>,
     encryptor_buf_offset: usize,
 }
@@ -389,7 +389,7 @@ impl<T> PeStream<T> where T: AsyncRead + AsyncWrite + Unpin {
                 break;
             }
         }
-        let hash = hash.ok_or(PeError::InfoHashMismatch)?;
+        let hash = hash.ok_or(PeError::InfoHashNotFound)?;
         let recv_key: [u8; 20] = <Sha1 as Digest>::new()
             .chain_update(b"keyA")
             .chain_update(share_key.to_bytes_be())
@@ -571,24 +571,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_pe_stream() {
-        let (a, b) = tokio::io::duplex(1024);
-        let hash = InfoHash::zero();
-        // Start handshake...
-        let (a, b) = tokio::join!(
-            PeStream::server_handshake(a, || {
-                return vec![hash].into_iter();
-            }),
-            PeStream::client_handshake(b, hash),
-        );
-        let mut left = a.unwrap();
-        let mut right = b.unwrap();
+        for _ in 0..10 {
+            let (a, b) = tokio::io::duplex(1024);
+            let hash = InfoHash::zero();
+            // Start handshake...
+            let (a, b) = tokio::join!(
+                PeStream::server_handshake(a, || {
+                    return vec![hash].into_iter();
+                }),
+                PeStream::client_handshake(b, hash),
+            );
+            let mut left = a.unwrap();
+            let mut right = b.unwrap();
 
-        // Try to write some data
-        let data = b"Hello, world!";
-        left.write_all(data).await.unwrap();
-        let mut buf = [0u8; 1024];
-        let n = right.read(&mut buf).await.unwrap();
-        assert_eq!(n, data.len());
-        assert_eq!(&buf[..n], data);
+            // Try to write some data
+            let mut data = [0u8; 512];
+            fastrand::fill(&mut data);
+            left.write_all(&data).await.unwrap();
+            let mut buf = [0u8; 512];
+            let n = right.read_exact(&mut buf).await.unwrap();
+            assert_eq!(n, data.len());
+            assert_eq!(&buf[..n], data);
+        }
     }
 }

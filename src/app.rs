@@ -223,6 +223,7 @@ impl App {
                 ip: conf.bind_addr,
                 hash_lru_cache_size: conf.hash_lru,
                 controller: app.inner.clone(),
+                trackers: vec![],
             }
         };
         let crawler = match Crawler::new(config).await {

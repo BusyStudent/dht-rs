@@ -7,6 +7,7 @@ use tracing::{trace, debug};
 use thiserror::Error;
 use crate::bencode::Object;
 use crate::InfoHash;
+use super::PeError;
 
 // LEN(1) + "BitTorrent protocol"(19) + reserved bytes(8) + infohash(20) + peerid(20)
 // struct alignas (1) BtHandshakeMessage {
@@ -77,7 +78,7 @@ struct BtStreamInner {
 
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Copy)]
 pub struct PeerId {
     data: [u8; 20]
 }
@@ -109,6 +110,11 @@ pub struct BtStream<T> {
 
 #[derive(Debug, Error)]
 pub enum BtError {
+    // Pe Part
+    #[error("Error from the low level pe part: {}", .0)]
+    EncryptionFailed(#[from] PeError),
+
+    // Common Part
     #[error("Failed to do the extension handshake")]
     ExtHanshakeFailed,
 
@@ -133,9 +139,11 @@ pub enum BtError {
     #[error("User defined error: {}", .0)]
     UserDefined(String),
 
+    // Network Part
     #[error("NetworkError {:?}", .0)]
     NetworkError(#[from] io::Error),
 }
+
 
 mod utils {
     use tracing::warn;

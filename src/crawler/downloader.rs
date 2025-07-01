@@ -1,9 +1,10 @@
 #![allow(dead_code)] // Let it shutup!
 
 use crate::utp::{UtpContext, UtpSocket, UtpListener};
-use crate::bt::{BtStream, BtHandshakeInfo, BtMessage, BtError, PeerId, UtMetadataMessage};
+use crate::bt::{BtError, BtHandshakeInfo, BtMessage, BtStream, PeStream, PeerId, UtMetadataMessage};
 use crate::InfoHash;
 use crate::bencode::Object;
+use lru::LruCache;
 use sha1::Digest;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
@@ -12,7 +13,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
 use tokio::task::JoinSet;
-use tracing::warn;
+use tracing::{debug, warn};
 use std::collections::HashMap;
 use std::{
     net::SocketAddr,
@@ -32,6 +33,7 @@ struct DownloaderInner {
     controller: OnceLock<Weak<dyn DownloaderController + Sync + Send> >,
     sem: Semaphore, // For limit max running workers
     cancel_watch: OnceLock<watch::Receiver<bool> >,
+    hashes: Mutex<LruCache<InfoHash, ()> >, // Lru for store downloading hash, for PeStream::handshake
     utp_context: UtpContext,
     peer_id: PeerId,
     bind_ip: SocketAddr,
@@ -66,6 +68,7 @@ impl Downloader {
             controller: OnceLock::new(),
             sem: Semaphore::new(MAX_WORKERS),
             cancel_watch: OnceLock::new(),
+            hashes: Mutex::new(LruCache::new(1000.try_into().unwrap())), // TODO: Make 1000 configurable
             utp_context: config.utp_context,
             peer_id: config.peer_id,
             bind_ip: config.bind_ip,
@@ -250,13 +253,14 @@ impl Downloader {
     async fn download(self, hash: InfoHash, ip: SocketAddr) -> Result<Vec<u8>, BtError> {
         let info = self.make_handshake_info(hash);
         // Try try utp first
-        info!("Utp: Connecting to {ip} for hash {hash}");
+        debug!("Utp: Connecting to {ip} for hash {hash}");
         if let Ok(utp) = UtpSocket::connect(&self.inner.utp_context, ip).await {
-            let stream = BtStream::client_handshake(utp, info).await?;
+            let pe = PeStream::client_handshake(utp, hash).await?;
+            let stream = BtStream::client_handshake(pe, info).await?;
             return Self::download_impl(stream, hash).await;
         }
         // Try tcp ...
-        info!("Tcp: Connecting to {ip} for hash {hash}");
+        debug!("Tcp: Connecting to {ip} for hash {hash}");
         let tcp = TcpStream::connect(ip).await?;
         let stream = BtStream::client_handshake(tcp, info).await?;
         return Self::download_impl(stream, hash).await;
@@ -272,9 +276,9 @@ impl Downloader {
         };
         let this = self.clone();
         let stream = BtStream::server_handshake(stream, |req| async move {
-            info!("Handshake request: for hash {}", req.hash);
+            debug!("Handshake request: for hash {}", req.hash);
             if controller.has_metadata(req.hash) {
-                info!("Already have metadata for {}", req.hash);
+                debug!("Already have metadata for {}", req.hash);
                 return Err(BtError::UserDefined("Already have metadata".into()));
             }
             let info = this.make_handshake_info(req.hash);
@@ -297,15 +301,42 @@ impl Downloader {
     }
 
     async fn handle_incoming<T: AsyncRead + AsyncWrite + Unpin>(self, proto: &'static str, stream: T, peer: SocketAddr) {
+        // Try PE?
+        let collect_hashes = || {
+            let hashes = self.inner.hashes.lock().unwrap();
+            let mut res = Vec::new();
+            for (hash, _) in hashes.iter() {
+                res.push(hash.clone());
+            }
+            return res.into_iter();
+        };
+        let stream = match PeStream::server_handshake(stream, collect_hashes).await {
+            Ok(stream) => {
+                if stream.has_encryption() { // Encrypted,
+                    debug!("{proto}: Got PE handshake from peer {peer}");
+                }
+                stream
+            },
+            Err(pe) => {
+                debug!("{proto}: Failed to pe handshake with peer {peer} error: {pe}");
+                return;
+            }
+        };
+        let enc = if stream.has_encryption() {
+            " encrypted"
+        }
+        else {
+            ""
+        };
         match self.handle_incoming_impl(stream).await {
-            Ok(_) => {
-                info!("{proto}: Successfully downloaded metadata from peer: {peer}");
+            Ok(hash) => {
+                info!("{proto}{enc}: Successfully downloaded metadata of {hash} from peer: {peer}");
             }
             Err(BtError::InvalidProtocolString) => {
-                warn!("{proto}: Invalid protocol string from peer: {peer}");
+                debug!("{proto}{enc}: Invalid protocol string from peer: {peer}");
             }
             Err(err) => { // Another error
-                info!("{proto}: Failed to get any metadata from peer: {peer} error: {err}");
+                debug!("{proto}{enc}: Failed to get any metadata from peer: {peer} error: {err}");
             }
         }
         return;
@@ -313,6 +344,7 @@ impl Downloader {
 
     /// Add a new peer to the downloader
     pub fn add_peer(&self, hash: InfoHash, ip: SocketAddr) {
+        self.add_hash(hash);
         debug_assert!(self.inner.controller.get().is_some(), "Controller should be set");
         let mut workers = self.inner.workers.lock().unwrap();
         if let Some((_, sender)) = workers.get(&hash) {
@@ -337,10 +369,10 @@ impl Downloader {
         let handle = tokio::spawn(async move {
             tokio::select! {
                 _ = watch.changed() => {
-                    info!("Worker for {hash} cancelled");
+                    debug!("Worker for {hash} cancelled");
                 }
                 _ = this.worker_main(hash, receiver) => {
-                    info!("Worker for {hash} exited");
+                    debug!("Worker for {hash} exited");
                 }
             }
             this.cancel(hash); // Doing cleanup
@@ -349,12 +381,19 @@ impl Downloader {
         workers.insert(hash, (handle.abort_handle(), sender));
     }
 
+    /// Add an hash to the internal lru cache, it will used to decrypt the PeStream
+    pub fn add_hash(&self, hash: InfoHash) {
+        self.inner.hashes.lock().unwrap().push(hash, ());
+    }
+
     /// Cancel a download
     pub fn cancel(&self, hash: InfoHash) {
         // self.done_job(hash);
         if let Some((handle, _)) = self.inner.workers.lock().unwrap().remove(&hash) {
             handle.abort();
         }
+        // Remove from the hash_lru
+        self.inner.hashes.lock().unwrap().pop(&hash);
     }
 
     /// Set the controller
