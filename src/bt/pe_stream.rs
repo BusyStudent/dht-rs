@@ -44,6 +44,7 @@ pub enum PeError {
 pub struct PeStream<T> {
     stream: BufReader<T>, // The underlying stream, use BufReader to easily impl the handshake :(
     cipher: Cipher,
+    hash: Option<InfoHash>,
     
     // Init...
     init_payload: Vec<u8>,
@@ -145,8 +146,7 @@ mod utils {
             // Add it to part
             part.extend_from_slice(&buf);
             if let Some(pos) = contain_sync(&part) {
-                stream.consume(pos - prev_part_len);
-                stream.consume(sync_mark.len()); // Discard sync mark
+                stream.consume((pos + sync_mark.len()) - prev_part_len); // Discard sync mark and padding
                 return Ok(());
             }
             stream.consume(buf.len());
@@ -184,7 +184,21 @@ impl<T> PeStream<T> where T: AsyncRead + AsyncWrite + Unpin {
 
     /// Check if the stream is encrypted
     pub fn has_encryption(&self) -> bool {
-        return self.cipher != Cipher::PlainText;
+        return self.cipher != Cipher::PassThrough;
+    }
+
+    /// Get the hash we used to do handshake, None on server handshake (PassThrough Mode)
+    pub fn hash(&self) -> Option<InfoHash> {
+        return self.hash;
+    }
+
+    /// Get underlying stream
+    pub fn get_ref(&self) -> &T {
+        return self.stream.get_ref();
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        return self.stream.get_mut();
     }
 
     /// Doing PE handshake as client, it will success if the server is also PE-enabled
@@ -293,6 +307,7 @@ impl<T> PeStream<T> where T: AsyncRead + AsyncWrite + Unpin {
         return Ok(PeStream {
             stream: stream,
             cipher: cipher,
+            hash: Some(hash),
             init_payload: Vec::new(),
             encryptor: match cipher {
                 Cipher::PlainText | Cipher::PassThrough => None, // No encryption
@@ -319,11 +334,11 @@ impl<T> PeStream<T> where T: AsyncRead + AsyncWrite + Unpin {
         stream.read_exact(&mut tmp_buf[0..20]).await?;
         if &tmp_buf[0..20] == b"\x13BitTorrent protocol" {
             // Not PE, just pass through
-            let init_payload = stream.buffer().to_vec();
-            stream.consume(init_payload.len());
+            let init_payload = tmp_buf[0..20].to_vec(); // Add the previous 20 bytes
             return Ok(Self {
                 stream: stream,
                 cipher: Cipher::PassThrough,
+                hash: None, // No PE, we can't find the hash in this layer
 
                 // Save the buffer, avoid loss data
                 init_payload: init_payload, 
@@ -469,6 +484,7 @@ impl<T> PeStream<T> where T: AsyncRead + AsyncWrite + Unpin {
         return Ok(PeStream {
             stream: stream,
             cipher: cipher,
+            hash: Some(hash),
             init_payload: init_buf,
             encryptor: match cipher {
                 Cipher::PlainText | Cipher::PassThrough => None, // No encryption
@@ -571,9 +587,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_pe_stream() {
-        for _ in 0..10 {
+        for _ in 0..10000 {
             let (a, b) = tokio::io::duplex(1024);
-            let hash = InfoHash::zero();
+            let hash = InfoHash::rand();
             // Start handshake...
             let (a, b) = tokio::join!(
                 PeStream::server_handshake(a, || {

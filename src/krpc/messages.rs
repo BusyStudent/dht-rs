@@ -1,11 +1,11 @@
 #![allow(dead_code)] // Let it shutup!
 
-use super::{InfoHash, NodeId, Object };
+use crate::{InfoHash, NodeId, bencode::Object, core::compact};
 use std::{collections::BTreeMap, net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr}};
 
-pub trait Message {
+pub trait Message : Sized {
     fn to_bencode(&self) -> Object;
-    fn from_bencode(obj: &Object) -> Option<Self> where Self: Sized;
+    fn from_bencode(obj: &Object) -> Option<Self>;
 }
 
 pub trait KrpcReply : Message {
@@ -145,41 +145,11 @@ fn parse_nodes(mut slice: &[u8]) -> Option<Vec<(NodeId, SocketAddr)> > {
     return Some(vec);
 }
 
-/// Parse the compressed ip string ipv4(4) or ipv6(16) addr, 2 bytes port
-fn parse_ip(slice: &[u8]) -> Option<SocketAddr> {
-    match slice.len() {
-        6 => {
-            let addr: [u8; 4] = slice[0..4].try_into().ok()?;
-            let port: [u8; 2] = slice[4..6].try_into().ok()?;
-            return Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(addr)), u16::from_be_bytes(port)));
-        },
-        18 => {
-            let addr: [u8; 16] = slice[0..16].try_into().ok()?;
-            let port: [u8; 2] = slice[16..18].try_into().ok()?;
-            return Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(addr)), u16::from_be_bytes(port)));
-        },
-        _ => return None
-    }
-}
-
-fn encode_ip_to(out: &mut Vec<u8>, ip: &SocketAddr) {
-    match ip {
-        SocketAddr::V4(v4) => {
-            out.extend_from_slice(v4.ip().octets().as_slice());
-            out.extend_from_slice(v4.port().to_be_bytes().as_slice());
-        },
-        SocketAddr::V6(v6) => {
-            out.extend_from_slice(v6.ip().octets().as_slice());
-            out.extend_from_slice(v6.port().to_be_bytes().as_slice());
-        },
-    }
-}
-
 // Encode the (NodeId 20 bytes, ipv4(4) or ipv6(16) addr, 2 bytes port) to the vec's back
 fn encode_nodes_to(out: &mut Vec<u8>, nodes: &[(NodeId, SocketAddr)]) {
     for (id, ip) in nodes {
         out.extend_from_slice(id.as_slice());
-        encode_ip_to(out, ip);
+        compact::encode_ip_to(out, ip);
     }
 }
 
@@ -367,7 +337,7 @@ impl Message for GetPeersReply {
             let mut values = Vec::new();
             for ip in &self.values {
                 let mut buf = Vec::new();
-                encode_ip_to(&mut buf, ip);
+                compact::encode_ip_to(&mut buf, ip);
                 values.push(Object::from(buf));
             }
             dict.insert(b"values".to_vec(), Object::from(values));
@@ -395,7 +365,7 @@ impl Message for GetPeersReply {
         if let Some(val) = values {
             for value in val.as_list()? {
                 let ip = value.as_string()?;
-                let ip = parse_ip(ip)?;
+                let ip = compact::parse_ip(ip)?;
                 out_values.push(ip);
             }
         }

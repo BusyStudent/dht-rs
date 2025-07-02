@@ -118,8 +118,8 @@ pub enum BtError {
     #[error("Failed to do the extension handshake")]
     ExtHanshakeFailed,
 
-    #[error("Failed to handshake, because of the wrong protocol string")]
-    InvalidProtocolString,
+    #[error("Failed to handshake, because of the wrong protocol string: {:?}", .0)]
+    InvalidProtocolString([u8; 20]),
 
     #[error("Failed to handshake, because of the hanshake request infohash mismatch")]
     InfoHashMismatch(InfoHash),
@@ -187,8 +187,12 @@ mod utils {
         let mut cursor = &buffer[..];
         if cursor[0] as usize != BT_PROTOCOL_LEN ||  &cursor[1..BT_PROTOCOL_LEN + 1] != BT_PROTOCOL_STR {
             // Dump it
-            warn!("Invalid protocol string: len: {} str: {:?}", cursor[0], &cursor[1..BT_PROTOCOL_LEN + 1]);
-            return Err(BtError::InvalidProtocolString);
+            let span = cursor[0..20].try_into().unwrap();
+            #[cfg(debug_assertions)] { // Only dump in debug mode
+                let backtrace = std::backtrace::Backtrace::capture();
+                warn!("Invalid protocol string str: {:?}, backtrace: {:?}", span, backtrace);
+            }
+            return Err(BtError::InvalidProtocolString(span));
         }
         cursor = &cursor[BT_PROTOCOL_LEN + 1..];
 

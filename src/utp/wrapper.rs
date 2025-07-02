@@ -20,7 +20,7 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::UdpSocket,
-    sync::mpsc,
+    sync::{mpsc, mpsc::error::TrySendError},
 };
 
 use tracing::{debug, error, trace};
@@ -242,8 +242,11 @@ impl UtpContextInner {
         // We need to send the data
         match self.udp_send.try_send((data.to_vec(), addr)) {
             Ok(_) => {}
-            Err(err) => {
-                error!("Failed to send UDP packet: {:?}, maybe queue is full", err);
+            Err(TrySendError::Full(_)) => {
+                error!("Failed to send UDP packet: queue is full, the packet maybe lost");
+            }
+            Err(TrySendError::Closed(_)) => {
+                // The channel is closed, cleanuping...
             }
         }
         return 0;
@@ -292,6 +295,7 @@ impl UtpSocket {
         let sock = UtpSocket::new(ctxt);
         unsafe {
             trace!("UtpSocket {:?} connecting to {}", sock.inner.utp_socket, addr);
+            let _lock = sock.ctxt.utp_ctxt.lock().unwrap(); // Lock the context, safer
             let os_addr = rs_addr_to_c(&addr);
             let (addr, len) = os_addr.to_ptr_len();
             let ret = utp_connect(sock.inner.utp_socket.get(), addr, len);

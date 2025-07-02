@@ -26,7 +26,7 @@ use dht_rs::{
     *
 };
 
-use tracing::{info};
+use tracing::{error, info, warn};
 
 #[derive(Deserialize, Serialize, Clone)]
 struct Config {
@@ -82,11 +82,27 @@ impl CrawlerController for AppInner {
     }
 
     fn has_metadata(&self, hash: InfoHash) -> bool {
-        return self.storage.has_torrent(hash).unwrap_or(false);
+        let have = self.storage.has_torrent(hash);
+        if let Err(e) = &have {
+            error!("Can not check if the metadata exists: {}", e);
+        }
+        return have.unwrap_or(false);
+    }
+
+    fn on_message(&self, message: String) {
+        let _ = self.broadcast.send(Some(message)); // On WebUI!
     }
 
     fn on_metadata_downloaded(&self, _hash: InfoHash, data: Vec<u8>) {
-        let torrent = Torrent::from_info_bytes(&data).expect("It should never failed");
+        let torrent = match Torrent::from_info_bytes(&data) {
+            None => { // Save it to the disk
+                warn!("Can not parse the torrent, save {} it to the disk", _hash);
+                let mut file = fs::File::create(format!("./data/{}.torrent", _hash)).unwrap();
+                let _ = file.write_all(&data);
+                return;
+            }
+            Some(val) => val,
+        };
         let _ = self.broadcast.send(Some(format!("Downloaded a new torrent: {}", torrent.name()))); // On WebUI!
         let _ = self.storage.add_torrent(&torrent);
     }

@@ -55,6 +55,9 @@ pub trait CrawlerController {
     /// Called when a metadata is downloaded
     fn on_metadata_downloaded(&self, hash: InfoHash, _data: Vec<u8>);
 
+    /// Called when an message should be send to the ui
+    fn on_message(&self, message: String);
+
     /// Check did we has this metadata?
     fn has_metadata(&self, hash: InfoHash) -> bool;
 }
@@ -236,7 +239,14 @@ impl PeerFinderController for CrawlerInner {
         };
         let old = self.too_many_hash.swap(new, Ordering::Relaxed);
         if old != new {
-            info!("Too many hash, auto sample is {new}");
+            let msg = if new { 
+                "Too many hash, auto sample is disabled" 
+            } 
+            else { 
+                "Hash count is normal, auto sample is enabled"
+            };
+            self.controller.on_message(msg.into());
+            info!("{msg}");
         }
     }
 }
