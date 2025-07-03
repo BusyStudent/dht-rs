@@ -1,16 +1,15 @@
 // FIXME: It may bug here, the tid mismatch in many times...
 use tokio::net::UdpSocket;
-use thiserror::Error;
 use tokio::sync::broadcast;
 use tokio::sync::oneshot;
-use tracing::warn;
+use tracing::{warn, trace};
+use async_trait::async_trait;
+use url::{Url, Host};
 
+use crate::core::compact;
 use crate::InfoHash;
-use crate::PeerId;
+use super::{TrackerError, AnnounceInfo, AnnounceResult, ScrapedItem, Tracker};
 use std::collections::HashMap;
-use std::net::IpAddr;
-use std::net::Ipv4Addr;
-use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -39,15 +38,6 @@ enum Action {
     Error    = 3,
 }
 
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Event {
-    None      = 0,
-    Completed = 1,
-    Started   = 2,
-    Stopped   = 3,
-}
-
 #[derive(Default)]
 struct ConnectionIdState {
     id: Option<(u64, Instant)>,
@@ -55,6 +45,7 @@ struct ConnectionIdState {
 }
 
 struct UdpTrackerInner {
+    url: Url, // The url of the tracker
     addr: SocketAddr,
     sockfd: Arc<UdpSocket>, // Used for sending and receiving
 
@@ -76,56 +67,6 @@ pub struct UdpTracker {
     inner: Arc<UdpTrackerInner>,
 }
 
-
-#[derive(Debug, Clone)]
-pub struct AnnounceInfo {
-    pub hash: InfoHash,
-    pub peer_id: PeerId,
-    pub port: u16,
-
-    pub downloaded: u64,
-    pub uploaded: u64,
-    pub left: u64,
-    pub event: Event,
-
-    pub num_want: Option<u32>, // None means default (-1 in the proto)
-}
-
-pub struct AnnounceResult {
-    pub interval: u32,
-    pub seeders: u32,
-    pub leechers: u32,
-    pub peers: Vec<SocketAddr>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ScrapedItem {
-    pub seeders: u32,
-    pub leechers: u32,
-    pub completed: u32,
-}
-
-#[derive(Error, Debug, Clone)]
-pub enum TrackerError {
-    #[error("Invalid request to tracker, we can't send more than {MAX_SCRAPE} scrape requests at once")]
-    MaxScrapeReached,
-
-    #[error("Error reply from tracker: {0}")]
-    Error(String),
-
-    #[error("Invalid reply from tracker")]
-    InvalidReply,
-
-    #[error("Unknown error")]
-    Unknown,
-
-    #[error("Request Timed out")]
-    TimedOut,
-
-    #[error("Network error: {0}")]
-    NetworkError(String) // The io::Error is not cloneable :(, use String to store the message
-}
-
 struct CancelGuard<'a> {
     tid: u32,
     tracker: &'a UdpTrackerInner,
@@ -133,8 +74,32 @@ struct CancelGuard<'a> {
 }
 
 impl UdpTracker {
-    pub fn new(addr: SocketAddr, sockfd: Arc<UdpSocket>) -> Self {
-        return Self { inner: Arc::new(UdpTrackerInner {
+    pub async fn new(url: &Url, sockfd: Arc<UdpSocket>) -> Option<Self> {
+        let local_addr = sockfd.local_addr().ok()?;
+        if url.scheme() != "udp" {
+            return None;
+        }
+        let port = url.port()?;
+        let addr = match url.host()? {
+            Host::Ipv4(ip) => SocketAddr::new(ip.into(), port),
+            Host::Ipv6(ip) => SocketAddr::new(ip.into(), port),
+            Host::Domain(domain) => {
+                // Lookup the domain
+                let host = format!("{domain}:{port}");
+                let mut addrs = tokio::net::lookup_host(&host)
+                    .await.ok()?
+                    .filter(|addr| addr.is_ipv4() == local_addr.is_ipv4()); // Same family
+
+                addrs.next()?
+            }
+        };
+        // Family not same
+        if addr.is_ipv4() != local_addr.is_ipv4() {
+            return None;
+        }
+        trace!("Tracker: {}, New for {}", url, addr);
+        return Some(Self { inner: Arc::new(UdpTrackerInner {
+            url: url.clone(),
             addr: addr,
             sockfd: sockfd,
             pending: Mutex::new(HashMap::new()),
@@ -143,12 +108,16 @@ impl UdpTracker {
             con_state: Mutex::new(ConnectionIdState {
                 ..Default::default()
             })
-        })};
+        })});
     }
 
     // Get the peer address of the tracker
     pub fn peer_addr(&self) -> SocketAddr {
         return self.inner.addr;
+    }
+
+    pub fn into_dyn(self) -> Arc<dyn Tracker + Sync + Send> {
+        return Arc::new(self);
     }
 
     // Do a connect request to the tracker and return the connection id
@@ -157,6 +126,7 @@ impl UdpTracker {
         // u64: protocol id
         // u32: action
         // u32: transaction id
+        trace!("Tracker: {}, Connecting to", self.inner.url);
         let bytes = self.send_request(PROTOCOL_ID, Action::Connect, &[]).await?;
         let con_id = match bytes[..].try_into() {
             Err(_) => return Err(TrackerError::InvalidReply),
@@ -227,6 +197,7 @@ impl UdpTracker {
         buf.extend_from_slice(data);
 
         // Request build done, now we send it
+        trace!("Tracker: {}, Sending request: {:?}, tid: {}", self.inner.url, action, tid);
         let (tx, rx) = oneshot::channel();
         let mut guard = CancelGuard::new(tid, &self.inner);
         self.inner.pending.lock().unwrap().insert(tid, tx);
@@ -241,6 +212,7 @@ impl UdpTracker {
                 return Err(TrackerError::Unknown);
             },
         };
+        trace!("Tracker: {}, Got request: {:?}, tid: {}", self.inner.url, ret_action, tid);
         // Done, async get the result, now we can remove the guard
         guard.disarm();
 
@@ -282,12 +254,12 @@ impl UdpTracker {
             let _ = sender.send((action, bytes));
             return true;
         }
-        warn!("Trakcer for {}, get a reply with unknown tid: {}", self.inner.addr, tid);
+        warn!("Trakcer {}, Unknown tid: {}, from {}", self.inner.url, tid, addr);
         return true; // Valid packet, belong us, but the tid did not match
     }
 
     // Do the announce request to the tracker and return the list of peers
-    pub async fn announce(&self, info: AnnounceInfo) -> Result<AnnounceResult, TrackerError> {
+    async fn announce_impl(&self, info: AnnounceInfo) -> Result<AnnounceResult, TrackerError> {
         // 20B: info_hash
         // 20B: peer_id
         // u64: downloaded
@@ -328,35 +300,32 @@ impl UdpTracker {
         let left = &bytes[12..];
         let mut peers = Vec::new();
 
-        if left.len() % 6 == 0 { // IPV4
-            for chunk in left.chunks_exact(6) {
-                let ip: [u8; 4] = chunk[0..4].try_into().unwrap();
-                let port: [u8; 2] = chunk[4..6].try_into().unwrap();
-
-                peers.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), u16::from_be_bytes(port)));
-            }
+        let chunk_size = if left.len() % 6 == 0 { // IPV4
+            6
         }
         else if left.len() % 18 == 0 { // IPV6
-            for chunk in left.chunks_exact(18) {
-                let ip: [u8; 16] = chunk[0..16].try_into().unwrap();
-                let port: [u8; 2] = chunk[16..18].try_into().unwrap();
-                
-                peers.push(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(ip)), u16::from_be_bytes(port)));
-            }
+            18
         }
         else {
             return Err(TrackerError::InvalidReply);
+        };
+        for chunk in left.chunks(chunk_size) {
+            peers.push(compact::parse_ip(chunk).ok_or(TrackerError::InvalidReply)?);
         }
     
         return Ok(AnnounceResult {
             interval: interval,
-            leechers: leechers,
-            seeders: seeders,
             peers: peers,
+            leechers: Some(leechers),
+            seeders: Some(seeders),
+
+            // Unavailable in UDP Tracker
+            completed: None,
+            external_ip: None,
         });
     }
 
-    pub async fn scrape(&self, hashes: &[InfoHash]) -> Result<Vec<ScrapedItem>, TrackerError> {
+    async fn scrape_impl(&self, hashes: &[InfoHash]) -> Result<HashMap<InfoHash, ScrapedItem>, TrackerError> {
         if hashes.len() > MAX_SCRAPE {
             return Err(TrackerError::MaxScrapeReached);
         }
@@ -371,22 +340,38 @@ impl UdpTracker {
         // u32: seeders
         // u32: leechers
         // u32: completed
-        if bytes.len() % 12 != 0 {
+        if bytes.len() % 12 != 0 || hashes.len() * 12 != bytes.len() {
             return Err(TrackerError::InvalidReply);
         }
-        let mut ret = Vec::new();
-        for chunk in bytes.chunks_exact(12) {
+        let mut map = HashMap::new();
+        for (idx, chunk) in bytes.chunks_exact(12).enumerate() {
             let seeders = u32::from_be_bytes(chunk[0..4].try_into().unwrap());
             let leechers = u32::from_be_bytes(chunk[4..8].try_into().unwrap());
             let completed = u32::from_be_bytes(chunk[8..12].try_into().unwrap());
+            let hash = hashes[idx];
 
-            ret.push(ScrapedItem {
+            map.insert(hash, ScrapedItem {
                 seeders: seeders,
                 leechers: leechers,
                 completed: completed,
             });
         }
-        return Ok(ret);
+        return Ok(map);
+    }
+}
+
+#[async_trait]
+impl Tracker for UdpTracker {
+    fn url(&self) -> Url {
+        return self.inner.url.clone();
+    }
+
+    async fn announce(&self, info: AnnounceInfo) -> Result<AnnounceResult, TrackerError> {
+        return self.announce_impl(info).await;
+    }
+
+    async fn scrape(&self, hashes: &[InfoHash]) -> Result<HashMap<InfoHash, ScrapedItem>, TrackerError> {
+        return self.scrape_impl(hashes).await;
     }
 }
 
@@ -408,7 +393,7 @@ impl<'a> CancelGuard<'a> {
 impl<'a> Drop for CancelGuard<'a> {
     fn drop(&mut self) {
         if !self.disarm { // Cleanup when task was canceled
-            // warn!("Removing pending task: {} on tracker {}", self.tid, self.tracker.addr);
+            trace!("Tracker {} canceled task: {}", self.tracker.url, self.tid);
             self.tracker.pending.lock().unwrap().remove(&self.tid);
         }
     }
@@ -417,6 +402,7 @@ impl<'a> Drop for CancelGuard<'a> {
 #[cfg(test)]
 mod tests {
     use tracing::{error, info};
+    // use crate::{PeerId, bt::Event};
 
     use super::*;
 
@@ -424,10 +410,9 @@ mod tests {
     #[ignore]
     async fn smoke_test() {
         // udp://tracker.opentrackr.org:1337/announce
-        let mut ips = tokio::net::lookup_host("tracker.opentrackr.org:1337").await.unwrap();
         let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await.unwrap());
-        let addr = ips.find(|v| v.is_ipv4()).unwrap();
-        let tracker = UdpTracker::new(addr, udp.clone());
+        let url = Url::parse("udp://tracker.opentrackr.org:1337/announce").unwrap();
+        let tracker = UdpTracker::new(&url, udp.clone()).await.unwrap();
 
         // Try connect
         let tracker2 = tracker.clone();
@@ -448,16 +433,16 @@ mod tests {
         // Ubuntu 25.04
         let hash = InfoHash::from_hex("8a19577fb5f690970ca43a57ff1011ae202244b8").unwrap();
         let items = tracker.scrape(std::slice::from_ref(&hash)).await.unwrap();
-        let _result = tracker.announce(AnnounceInfo {
-            hash: hash,
-            peer_id: PeerId::rand(),
-            port: 11451,
-            uploaded: 0,
-            downloaded: 0,
-            left: 1,
-            event: Event::None,
-            num_want: None,
-        }).await.unwrap();
+        // let _result = tracker.announce(AnnounceInfo {
+        //     hash: hash,
+        //     peer_id: PeerId::rand(),
+        //     port: 11451,
+        //     uploaded: 0,
+        //     downloaded: 0,
+        //     left: 1,
+        //     event: Event::None,
+        //     num_want: None,
+        // }).await.unwrap();
         info!("Scraped: {items:?}");
         handle.abort();
         let _ = handle.await;

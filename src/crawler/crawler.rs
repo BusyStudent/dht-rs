@@ -26,6 +26,7 @@ struct CrawlerInner {
     downloader: Downloader,
     peer_finder: PeerFinder,
     sampler: Sampler,
+    tracker_manager: TrackerManager,
     controller: Arc<dyn CrawlerController + Send + Sync>,
 
     // State
@@ -82,7 +83,10 @@ impl Crawler {
         }
         let id = PeerId::from(id);
 
+        let tracker_manager = TrackerManager::new();
+
         let finder_config = PeerFinderConfig {
+            tracker_manager: tracker_manager.clone(),
             dht_session: session.clone(),
             udp_socket: udp.clone(),
             max_concurrent: 20, // 5 may be too small, use 20?
@@ -105,6 +109,7 @@ impl Crawler {
                 downloader: Downloader::new(downloader_config),
                 peer_finder: PeerFinder::new(finder_config),
                 sampler: Sampler::new(session.clone()),
+                tracker_manager: tracker_manager,
                 controller: config.controller,
 
                 hash_lru: Mutex::new(LruCache::new(config.hash_lru_cache_size)),
@@ -129,26 +134,27 @@ impl Crawler {
         this.inner.sampler.set_observer(weak);
         
         // Add Udp Tracker
-        this.inner.peer_finder.add_trackers(config.trackers).await;
+        this.inner.tracker_manager.add_tracker_list(&config.trackers).await;
 
         return Ok(this);
     }
 
     async fn process_udp(&self) {
-        let mut buf = [0u8; 65535];
+        let mut buffer = [0u8; 65535];
         loop {
-            let (n, addr) = match self.inner.udp.recv_from(&mut buf).await {
+            let (n, addr) = match self.inner.udp.recv_from(&mut buffer).await {
                 Ok(val) => val,
                 Err(err) => {
                     error!("Failed to recv data from udp socket: {}", err);
                     continue;
                 }
             };
-            if n == 0 {
+            let buf = &buffer[..n];
+            if buf.is_empty() {
                 continue;
             }
             if buf[0] == b'd' { // Dict, almost krpc
-                if self.inner.dht_session.process_udp(&buf[..n], &addr).await { // Successfully process it
+                if self.inner.dht_session.process_udp(buf, &addr).await { // Successfully process it
                     continue;
                 }
             }
@@ -159,14 +165,14 @@ impl Crawler {
                 // payload...
                 let action = u32::from_be_bytes(buf[0..4].try_into().unwrap());
                 if action < 4 { // Connect(0) ... Announce(3)
-                    if self.inner.peer_finder.process_udp(&buf[..n], &addr) {
+                    if self.inner.tracker_manager.process_udp(buf, &addr) {
                         continue;
                     }
                 }
             }
 
             // Try utp?
-            if self.inner.utp_context.process_udp(&buf[..n], &addr) {
+            if self.inner.utp_context.process_udp(buf, &addr) {
                 continue;
             }
             trace!("Unknown udp packet from {}: len: {}", addr, n);

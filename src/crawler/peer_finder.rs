@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    bt::{AnnounceInfo, AnnounceResult, BtError, Event, TrackerError, UdpTracker}, 
+    bt::{AnnounceInfo, AnnounceResult, BtError, Event, TrackerError, TrackerManager}, 
     dht::DhtSession, 
     InfoHash, PeerId
 };
@@ -25,10 +25,8 @@ struct PeerFinderInner {
     udp_socket: Arc<UdpSocket>, // The udp socket we used to new the udp tracker
     pending: Mutex<HashMap<InfoHash, JoinHandle<()>>>,
     sem: Semaphore, // Semaphore to limit the number of concurrent peer finding tasks
+    tracker_manager: TrackerManager,
     controller: OnceLock<Weak<dyn PeerFinderController + Sync + Send> >,
-
-    // Trackers
-    trackers: RwLock<HashMap<SocketAddr, UdpTracker> >,
 
     // Config
     max_retries: usize,
@@ -42,6 +40,7 @@ pub struct PeerFinder {
 }
 
 pub struct PeerFinderConfig {
+    pub tracker_manager: TrackerManager,
     pub dht_session: DhtSession,
     pub udp_socket: Arc<UdpSocket>,
     pub max_concurrent: usize,
@@ -55,12 +54,6 @@ pub trait PeerFinderController {
 
     // Called when the number of pending tasks changed, don't call any peer finder methods in this callback
     fn on_tasks_count_changed(&self, count: usize);
-}
-
-struct TaskStateGuard {
-    finder: PeerFinder,
-    hash: InfoHash,
-    trackers: HashMap<SocketAddr, UdpTracker>, // The the trackers we already announced to
 }
 
 impl PeerFinder {
@@ -82,9 +75,7 @@ impl PeerFinder {
                 pending: Mutex::new(HashMap::new()),
                 sem: Semaphore::new(config.max_concurrent),
                 controller: OnceLock::new(),
-
-                // Trackrs
-                trackers: RwLock::new(HashMap::new()),
+                tracker_manager: config.tracker_manager,
 
                 // Config
                 max_retries: config.max_retries,
@@ -92,15 +83,6 @@ impl PeerFinder {
                 peer_id: config.peer_id,
             }),
         };
-    }
-
-    /// Process the data from the udp tracker
-    pub fn process_udp(&self, data: &[u8], addr: &SocketAddr) -> bool {
-        if let Some(tracker) = self.inner.trackers.read().unwrap().get(addr) {
-            // Find the tracker in the map
-            return tracker.process_udp(data, addr);
-        }
-        return false;
     }
 
     /// Cancel the pending peer finding task for the given info hash
@@ -129,57 +111,6 @@ impl PeerFinder {
         
         map.insert(info_hash, handle);
         self.notify_tasks_count_changed(map.len());
-    }
-
-    // Do the announce on the tracker
-    // async fn tracker_announce(self, tracker: UdpTracker, hash: InfoHash, event: Event) -> Result<AnnounceResult, TrackerError> {
-    //     let info = AnnounceInfo {
-    //         hash: hash,
-    //         peer_id: self.inner.peer_id,
-    //         port: self.inner.bind_ip.port(),
-    //         downloaded: 0,
-    //         uploaded: 0,
-    //         left: 1,
-    //         event: event,
-    //         num_want: None, // Use default
-    //     };
-    //     let result = tracker.announce(info).await;
-    //     info!("Announce result: from tracker {}", tracker.peer_addr());
-    //     return result;
-    // }
-
-    // Add some trackers to it
-    async fn add_tracker(self, tracker_url: String) -> Option<()> {
-        // udp://example.com:port
-        let url = tracker_url.trim().strip_prefix("udp://")?;
-        let host = match url.rfind('/') {
-            Some(pos) => &url[..pos],
-            None => url,
-        };
-        for item in tokio::net::lookup_host(host).await.ok()? {
-            if self.is_same_family(&item) {
-                // Ok Got it
-                info!("Add udp tracker: {tracker_url} -> {item}");
-                let tracker = UdpTracker::new(item, self.inner.udp_socket.clone());
-                self.inner.trackers.write().unwrap().insert(item, tracker);
-                return Some(());
-            }
-        }
-        return None; // Emm? no ip found or not same family
-    }
-
-    pub async fn add_trackers(&self, trackers: Vec<String>) -> usize {
-        let mut join_set = JoinSet::new();
-        for tracker in trackers {
-            join_set.spawn(self.clone().add_tracker(tracker));
-        }
-        let mut sum = 0;
-        for result in join_set.join_all().await {
-            if result.is_some() {
-                sum += 1;
-            }
-        }
-        return sum;
     }
 
     // async fn find_peers_on_tracker(&self, hash: InfoHash, guard: &mut TaskStateGuard) -> Vec<SocketAddr> {
@@ -261,29 +192,6 @@ impl PeerFinder {
         self.notify_tasks_count_changed(map.len());
     }
 }
-
-// impl TaskStateGuard {
-//     fn new(finder: PeerFinder, hash: InfoHash) -> Self {
-//         return Self {
-//             finder: finder,
-//             hash: hash,
-//             trackers: HashMap::new()
-//         };
-//     }
-
-//     fn add_tracker_announced(&mut self, tracker: UdpTracker) {
-//         self.trackers.insert(tracker.peer_addr(), tracker);
-//     }
-// }
-
-// impl Drop for TaskStateGuard {
-//     fn drop(&mut self) {
-//         for (_, tracker) in self.trackers.iter() {
-//             // Do the cleanup, tell the tracker that we are stopped
-//             tokio::spawn(self.finder.clone().tracker_announce(tracker.clone(), self.hash, Event::Stopped)); 
-//         }
-//     }
-// }
 
 impl Drop for PeerFinder {
     fn drop(&mut self) {
