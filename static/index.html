@@ -98,13 +98,21 @@
             background-color: #c0392b;
         }
 
-        input[type="text"], input[type="number"] {
+        input[type="text"], input[type="number"], textarea {
             width: 100%;
             padding: 10px;
             margin-bottom: 10px;
             border: 1px solid #ccc;
             border-radius: 4px;
             box-sizing: border-box;
+            font-family: inherit; /* 确保字体与页面一致 */
+            font-size: 14px;      /* 确保字体大小与输入框一致 */
+            line-height: 1.5;     /* 增加行高，让多行文本更易读 */
+        }
+
+        textarea {
+            min-height: 150px; /* 设置一个合适的最小高度 */
+            resize: vertical;  /* 允许用户垂直拖动调整大小，非常实用 */
         }
 
         .form-group {
@@ -485,12 +493,19 @@
                 <label for="hash-lru-input">Hash LRU缓存的大小</label>
                 <input type="number" id="hash-lru-input" placeholder="不能为0">
             </div>
+            <div class="form-group">
+                <label for="trackers-input">Trackers 列表</label>
+                <textarea id="trackers-input" placeholder="每个 tracker 一行 #[url] 代表会从网络获取Url中的列表"></textarea>
+            </div>
             <button id="save-settings-btn" class="button">保存设置</button>
         </div>
 
     </div>
 
 <script>
+    // --- 常量 ---
+    const MAX_LOG_LINES = 1000;
+
     // --- 全局变量和初始化 ---
     let searchDebounceTimer; // 用于搜索防抖的计时器
     let routingTableTimer;   // 用于更新路由表的计时器
@@ -747,9 +762,27 @@
     function addLog(message) {
         const logWindow = document.getElementById('log-window');
         const timestamp = new Date().toLocaleTimeString();
-        logWindow.innerHTML += `[${timestamp}] ${message}\n`;
-        logWindow.scrollTop = logWindow.scrollHeight;
+
+        // 检查添加日志前，窗口是否已经滚动到底部
+        // 增加 1px 的容差，以应对不同浏览器的计算差异
+        const isScrolledToBottom = logWindow.scrollHeight - logWindow.clientHeight <= logWindow.scrollTop + 1;
+
+        // 使用 textContent 追加新日志，这比 innerHTML 更安全、性能更好
+        logWindow.textContent += `[${timestamp}] ${message}\n`;
+        
+        const lines = logWindow.textContent.split('\n');
+        if (lines.length > MAX_LOG_LINES + 1) {
+            // 太多日志
+            const newText = lines.slice(-MAX_LOG_LINES).join('\n');
+            logWindow.textContent = newText;
+        }
+
+        // 只有在添加日志前视图就在底部时，才自动滚动到底部
+        if (isScrolledToBottom) {
+            logWindow.scrollTop = logWindow.scrollHeight;
+        }
     }
+
     async function updateRoutingTable() {
         const list = document.getElementById('routing-table-list');
         const countSpan = document.getElementById('node-count');
@@ -1077,11 +1110,13 @@
                 return;
             }
             const config = await response.json();
+            const trackers = config['trackers'].join('\n');
 
             document.getElementById('webui-addr-input').value = config['webui_addr'];
             document.getElementById('bind-addr-input').value = config['bind_addr'];
             document.getElementById('node-id-input').value = config['node_id'];
             document.getElementById('hash-lru-input').value = config['hash_lru'];
+            document.getElementById('trackers-input').value = trackers;
         }
         catch (e) {
             console.log(e);
@@ -1093,6 +1128,7 @@
         const addr = document.getElementById('bind-addr-input').value;
         const id = document.getElementById('node-id-input').value;
         const hash_lru = document.getElementById('hash-lru-input').value;
+        const trackers = document.getElementById('trackers-input').value.split('\n').filter((url) => url.length != 0);
 
         try {
             const response = await fetch('/api/v1/set_config', {
@@ -1104,7 +1140,8 @@
                     webui_addr: webui_addr, 
                     bind_addr: addr, 
                     node_id: id,
-                    hash_lru: parseInt(hash_lru, 10)
+                    hash_lru: parseInt(hash_lru, 10),
+                    trackers: trackers,
                 })
             });
             const text = await response.text();

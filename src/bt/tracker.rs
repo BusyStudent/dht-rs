@@ -6,6 +6,9 @@ use std::net::SocketAddr;
 use thiserror::Error;
 use url::Url;
 
+/// The MAX number of scrape hash we can send to a tracker at once (UDP trackers limit this)
+pub const MAX_SCRAPE: usize = 74;  
+
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
@@ -50,7 +53,7 @@ pub struct ScrapedItem {
 
 #[derive(Error, Debug, Clone)]
 pub enum TrackerError {
-    #[error("Invalid request to tracker, we can't send more than 74 scrape requests at once")]
+    #[error("Invalid request to tracker, we can't send more than {MAX_SCRAPE} scrape requests at once")]
     MaxScrapeReached,
 
     #[error("Error reply from tracker: {0}")]

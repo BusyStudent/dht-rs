@@ -37,25 +37,30 @@ pub struct AnnounceTask {
 
 impl TrackerManager {
     pub fn new() -> Self {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .no_proxy()
+            .build()
+            .expect("Can't create http client");
         return Self {
             inner: Arc::new(TrackerManagerInner {
-                client: Client::new(),
+                client: client,
                 trackers: RwLock::new(HashMap::new()),
             })
         }
     }
 
     /// Get the trackers url name in the manager
-    pub fn trackers(&self) -> Vec<String> {
-        return self.inner.trackers.blocking_read()
+    pub async fn trackers(&self) -> Vec<String> {
+        return self.inner.trackers.read().await
             .keys()
             .map(|u| u.to_string())
             .collect();   
     }
 
     /// Add an instance of tracker to the manager
-    pub fn add_tracker_instance(&self, tracker: Arc<DynTracker>) {
-        self.inner.trackers.blocking_write()
+    pub async fn add_tracker_instance(&self, tracker: Arc<DynTracker>) {
+        self.inner.trackers.write().await
             .insert(tracker.url(), tracker);
     }
 
@@ -74,13 +79,14 @@ impl TrackerManager {
         }
         // Create the tracker
         let trakcer = match url.scheme() {
-            "http" | "https" => HttpTracker::new(&url, self.inner.client.clone())?,
+            "http" | "https" => HttpTracker::new(&url, self.inner.client.clone())?.into_dyn(),
             "udp" => return None, // TODO: UDP tracker
             _ => return None, // Invalid scheme
         };
+        info!("Added tracker {}", trakcer.url());
         // Add it to the map
         self.inner.trackers.write().await
-            .insert(trakcer.url(), trakcer.into_dyn());
+            .insert(trakcer.url(), trakcer);
         return Some(());
     }
 
@@ -107,9 +113,9 @@ impl TrackerManager {
 
 impl AnnounceTask {
     /// Create an new announce task
-    pub fn new(manager: TrackerManager, info: AnnounceInfo) -> Self {
+    pub async fn new(manager: TrackerManager, info: AnnounceInfo) -> Self {
         let mut actived = HashMap::new();
-        for tracker in manager.inner.trackers.blocking_read().values() {
+        for tracker in manager.inner.trackers.read().await.values() {
             let url = tracker.url();
             let state = TrackerState {
                 tracker: tracker.clone(),
@@ -127,23 +133,21 @@ impl AnnounceTask {
 
     /// Get the next announce time, None on no available trackers
     pub fn avg_next_announce(&self) -> Option<Instant> {
-        // Get the average of the next announce time
-        let mut sum: u128 = 0;
-        let mut n = 0;
-        let now = Instant::now();
         if self.actived.is_empty() {
             return None;
         }
-        for (_, state) in self.actived.iter() {
-            if let Some(next_announce) = state.next_announce {
-                if now > next_announce {
-                    return Some(Instant::now()); // We need to announce now
-                }
-                sum += next_announce.elapsed().as_millis();
-                n += 1;
-            }
+        // Get the average of the next announce time
+        let now = Instant::now();
+        let durations: Vec<Duration> = self.actived.values()
+            .filter_map(|state| state.next_announce )
+            .filter_map(|time| time.checked_duration_since(now))
+            .collect(); // Get all valid duration 
+        if durations.is_empty() {
+            return Some(now); // Announce now
         }
-        return Some(now + Duration::from_millis((sum / n) as u64));
+        let sum: Duration = durations.iter().sum();
+        let avg = sum / durations.len() as u32;
+        return Some(now + avg);
     }
 
     /// Do the announce
@@ -153,7 +157,7 @@ impl AnnounceTask {
             None => return Vec::new(),
         };
         let mut set = JoinSet::new();
-        for (_, state) in self.actived.iter_mut() {
+        for (_, state) in self.actived.iter() {
             let mut info = self.info.clone();
             if let Some(next_announce) = state.next_announce {
                 if Instant::now() < next_announce {
@@ -170,23 +174,43 @@ impl AnnounceTask {
         let mut vec = Vec::new();
         for (result, tracker) in set.join_all().await {
             let state = self.actived.get_mut(&tracker.url());
-            info!("Got reply from tracker: {}", tracker.url());
             match result {
                 Ok(val) => {
+                    info!("Got reply of {} from tracker: {}, {} peers", self.info.hash, tracker.url(), val.peers.len());
                     // Update the next announce time if exists
                     if let Some(state) = state {
                         state.next_announce = Some(Instant::now() + Duration::from_millis(val.interval as u64));
+                        state.last_error = None;
                     }
                     vec.push(val);
                 }
                 Err(err) => {
+                    info!("Got error of {} from tracker: {}, {}", self.info.hash, tracker.url(), err);
                     if let Some(state) = state {
+                        state.next_announce = Some(Instant::now() + Duration::from_secs(60 * 30)); // Next 30 minutes
                         state.last_error = Some(err);
                     }
                 }
             }
         }
         return vec;
+    }
+
+    /// Shutdown the announce task, send a stopped event to all trackers
+    pub async fn shutdown(&mut self) {
+        let mut info = self.info.clone();
+        let mut set = JoinSet::new();
+        info.event = Event::Stopped;
+        for (_, state) in self.actived.iter() {
+            if state.next_announce.is_none() {
+                // Never announce, skip it
+                continue;
+            }
+            let tracker = state.tracker.clone();
+            set.spawn(async move { tracker.announce(info).await });
+        }
+        let _ = set.join_all().await;
+        self.actived.clear();
     }
 
 }
@@ -196,7 +220,7 @@ impl Drop for AnnounceTask {
     fn drop(&mut self) {
         let mut info = self.info;
         info.event = Event::Stopped; // Notice the tracker that the we are quitting
-        for (_, state) in self.actived.iter().map(|t| t.clone()) {
+        for (_, state) in self.actived.iter() {
             if state.next_announce.is_none() {
                 // Never announce, skip it
                 continue;

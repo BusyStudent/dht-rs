@@ -8,7 +8,7 @@ use url::{Url, Host};
 
 use crate::core::compact;
 use crate::InfoHash;
-use super::{TrackerError, AnnounceInfo, AnnounceResult, ScrapedItem, Tracker};
+use super::{TrackerError, AnnounceInfo, AnnounceResult, ScrapedItem, Tracker, MAX_SCRAPE};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -19,7 +19,6 @@ use std::time::Instant;
 // All the constants are from BitTorrent spec
 const CONNECTION_EXPIRY: Duration = Duration::from_secs(60);
 const PROTOCOL_ID: u64 = 0x41727101980;
-const MAX_SCRAPE: usize = 74;
 
 // Our 
 const MAX_TIMEOUT: Duration = Duration::from_secs(10);

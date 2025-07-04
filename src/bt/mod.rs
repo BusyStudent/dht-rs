@@ -12,6 +12,6 @@ pub use pe_stream::{PeStream, PeError};
 pub use ext_messages::{UtMetadataMessage};
 pub use torrent::Torrent;
 pub use tracker_manager::{TrackerManager, AnnounceTask};
-pub use tracker::{TrackerError, AnnounceInfo, AnnounceResult, ScrapedItem, Event, Tracker};
+pub use tracker::{TrackerError, AnnounceInfo, AnnounceResult, ScrapedItem, Event, Tracker, MAX_SCRAPE};
 pub use http_tracker::HttpTracker;
 pub use udp_tracker::UdpTracker;

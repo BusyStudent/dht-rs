@@ -430,7 +430,6 @@ impl Downloader {
 
     /// Cancel a download
     pub fn cancel(&self, hash: InfoHash) {
-        // self.done_job(hash);
         if let Some((handle, _)) = self.inner.workers.lock().unwrap().remove(&hash) {
             handle.abort();
         }

@@ -99,11 +99,9 @@ impl HttpTracker {
         let reply = self.client
             .get(url)
             .send()
-            .await
-            .map_err(|e| TrackerError::NetworkError(e.to_string()))?
+            .await?
             .bytes()
-            .await
-            .map_err(|e| TrackerError::NetworkError(e.to_string()))?
+            .await?
         ;
         let object = match Object::parse(&reply) {
             Some(val) => val,
@@ -230,6 +228,12 @@ impl Tracker for HttpTracker {
 
     async fn scrape(&self, hashes: &[InfoHash]) -> Result<HashMap<InfoHash, ScrapedItem>, TrackerError> {
         return self.scrape_impl(hashes).await;
+    }
+}
+
+impl From<reqwest::Error> for TrackerError {
+    fn from(err: reqwest::Error) -> Self {
+        return TrackerError::NetworkError(format!("{:?}", err));
     }
 }
 

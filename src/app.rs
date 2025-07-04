@@ -34,6 +34,7 @@ struct Config {
     bind_addr: SocketAddr,
     node_id: NodeId,
     hash_lru: NonZero<usize>,
+    trackers: Vec<String>, // A list of trackers
 }
 
 /// The request from the webui
@@ -129,6 +130,9 @@ impl App {
 
                     // LRU Config
                     hash_lru: NonZero::new(1000 * 10).unwrap(), // 10K
+
+                    // Trackers
+                    trackers: Vec::new(),
                 }
             },
         };
@@ -239,7 +243,7 @@ impl App {
                 ip: conf.bind_addr,
                 hash_lru_cache_size: conf.hash_lru,
                 controller: app.inner.clone(),
-                trackers: vec!["https://tracker.zhuqiy.top:443/announce".into()],
+                trackers: conf.trackers.clone(),
             }
         };
         let crawler = match Crawler::new(config).await {

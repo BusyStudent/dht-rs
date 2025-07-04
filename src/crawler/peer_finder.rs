@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    bt::{AnnounceInfo, AnnounceResult, BtError, Event, TrackerError, TrackerManager}, 
+    bt::{AnnounceInfo, AnnounceResult, AnnounceTask, BtError, Event, TrackerError, TrackerManager}, 
     dht::DhtSession, 
     InfoHash, PeerId
 };
@@ -157,7 +157,17 @@ impl PeerFinder {
     }
 
     async fn find_peers(self, hash: InfoHash) {
-        // let mut guard = TaskStateGuard::new(self.clone(), hash);
+        let info = AnnounceInfo {
+            hash: hash,
+            peer_id: self.inner.peer_id,
+            port: self.inner.bind_ip.port(),
+            downloaded: 0,
+            uploaded: 0,
+            left: 1, // We need peers,
+            event: Event::Started,
+            num_want: None,
+        };
+        let mut task = AnnounceTask::new(self.inner.tracker_manager.clone(), info).await;
         for _ in 0..self.inner.max_retries {
             let premit = match self.inner.sem.acquire().await {
                 Ok(p) => p,
@@ -165,8 +175,15 @@ impl PeerFinder {
             };
             info!("Finding peers for {}", hash);
             // 1. Find peers on tracker
-            // let mut peers = self.find_peers_on_tracker(hash, &mut guard).await;
             let mut peers = Vec::new();
+            for item in task.announce().await {
+                for peer in item.peers.iter().filter(|addr| self.is_same_family(addr)) {
+                    peers.push(peer.clone());
+                }
+            }
+            peers.sort(); // Remove the duplicate
+            peers.dedup();
+            info!("Found {} peers for {} on tracker", peers.len(), hash);
             
             // 2. Find peers on dht if not enough
             if peers.len() < 50 {
