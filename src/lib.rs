@@ -25,6 +25,7 @@ mod tests {
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::TRACE)
             .with_thread_ids(true)
+            .pretty()
             .try_init();
     }
 }

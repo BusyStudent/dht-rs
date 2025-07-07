@@ -1,11 +1,9 @@
-#![allow(dead_code)] // Let it shutup!
-
 use std::collections::{BTreeMap, BTreeSet, HashSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 use tokio::{task::JoinSet, sync::RwLock};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, instrument, span, trace, warn, Instrument, Level};
 use thiserror::Error;
 use async_trait::async_trait;
 
@@ -380,6 +378,7 @@ impl DhtSession {
     }
 
     /// Find the nodes for the target node id, return the K-nearest nodes
+    #[instrument(skip(self))]
     pub async fn find_node(self, target: NodeId) -> Result<Vec<NodeEndpoint>, FindNodeError> {
         // Get the nodes from routing table
         let queue = self.routing_table_mut().find_node(target);
@@ -390,6 +389,7 @@ impl DhtSession {
     }
 
     /// Get the peers for the given infohash, return the peers and the K-nearest nodes
+    #[instrument(skip(self))]
     pub async fn get_peers(self, hash: InfoHash) -> Result<GetPeersResult, GetPeersError> {
         let queue = self.routing_table_mut().find_node(hash);
         if queue.is_empty() {
@@ -399,6 +399,7 @@ impl DhtSession {
     }
 
     /// Ping the nodes for the given ips
+    #[instrument(skip(self))]
     pub async fn ping(self, ip: SocketAddr) -> Result<NodeId, KrpcError> {
         let msg = PingQuery {
             id: self.inner.id
@@ -416,6 +417,7 @@ impl DhtSession {
     /// `port` The port to announce, if None, use implied port and the default port 6881
     /// 
     /// `token` The token to announce, can't be empty
+    #[instrument(skip(self))]
     pub async fn announce_peer(self, ip: SocketAddr, hash: InfoHash, port: Option<u16>, token: Vec<u8>) -> Result<(), KrpcError> {
         let msg = AnnouncePeerQuery {
             id: self.inner.id,
@@ -429,6 +431,7 @@ impl DhtSession {
     }
 
     /// Sample the infohashes from the given node
+    #[instrument(skip(self))]
     pub async fn sample_infohashes(self, ip: SocketAddr, target: NodeId) -> Result<SampleInfoHashesReply, KrpcError> {
         let msg = SampleInfoHashesQuery {
             id: self.inner.id,
@@ -515,7 +518,7 @@ impl DhtSession {
                 // info!("Collecting infohash {} from {}", query.info_hash, ip);
                 if query.token != ip.to_string().into_bytes() {
                     // Invalid token, ignore it
-                    error!("Invalid token: {:?}", query.token);
+                    error!("Invalid token: {:?} from {}", query.token, ip);
                     let reply = ErrorReply {
                         code: 203, // Invalid token
                         msg: "Invalid token".to_string(),
@@ -625,6 +628,7 @@ impl DhtSession {
     }
 
     /// Doing to refresh the routing table
+    #[instrument(skip(self))]
     async fn refresh_routing_table(&self) {
         loop {
             let mut ping_set = JoinSet::new();
@@ -645,9 +649,10 @@ impl DhtSession {
             let mut refresh_set = JoinSet::new();
             for i in self.routing_table_mut().less_node_buckets_indexes(8 / 2) { // Less than HALF K
                 // We need to fill the empty buckets, so we can find more nodes
+                let span = span!(Level::DEBUG, "refresh_bucket", index = i);
                 debug!("Refreshing bucket at index {}", i);
                 let id = NodeId::rand_with_prefix(self.inner.id, i);
-                refresh_set.spawn(self.clone().find_node(id));
+                refresh_set.spawn(self.clone().find_node(id).instrument(span));
             }
             let _ = refresh_set.join_all().await;
 
@@ -670,7 +675,7 @@ impl DhtSession {
         // Doing the bootstrap
         loop {
             if !self.bootstrap().await {
-                error!("DHT session bootstrap failed, retrying...");
+                warn!("DHT session bootstrap failed, retrying...");
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 continue;
             } 

@@ -14,10 +14,10 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::Semaphore;
 use tokio::task::AbortHandle;
 use tokio::task::JoinSet;
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 use std::{
     net::{SocketAddr, IpAddr},
-    sync::{Arc, Mutex, Weak, OnceLock, RwLock},
+    sync::{Arc, Mutex, Weak, OnceLock, RwLock, atomic::AtomicU64},
     collections::HashMap,
     time::Duration,
 };
@@ -37,8 +37,13 @@ struct DownloaderInner {
     hashes: Mutex<LruCache<InfoHash, ()> >, // Lru for store downloading hash, for PeStream::handshake
     my_ips: RwLock<LruCache<IpAddr, ()> >, // Lru for store self ip, (from dht ext handshake yourip)
     utp_context: UtpContext,
+    
+    // Config
     peer_id: PeerId,
     bind_ip: SocketAddr,
+
+    // Status
+    connections: AtomicU64,
 }
 
 pub struct DownloaderConfig {
@@ -77,6 +82,7 @@ impl Downloader {
             utp_context: config.utp_context,
             peer_id: config.peer_id,
             bind_ip: config.bind_ip,
+            connections: AtomicU64::new(0),
         })};
         return downloader;
     }
@@ -142,6 +148,7 @@ impl Downloader {
     }
 
     // Pulling the job from the queue
+    #[instrument(skip(self, receiver))]
     async fn worker_main(&self, hash: InfoHash, mut receiver: mpsc::Receiver<SocketAddr>) {
         let _premit = match self.inner.sem.acquire().await {
             Ok(val) => val,
@@ -188,6 +195,7 @@ impl Downloader {
     }
 
     // Do the attually download for given stream and hash
+    #[instrument(skip_all, fields(pieces, cur_index))]
     async fn download_impl<T: AsyncRead + AsyncWrite + Unpin>(&self, mut stream: BtStream<T>, hash: InfoHash) -> Result<Vec<u8>, BtError> {
         info!("Peer extension info: {:?}", stream.peer_info().extensions);
         // Emm get yourip here
@@ -200,6 +208,7 @@ impl Downloader {
             // info!("Self ip: {ip}");
             self.inner.my_ips.write().unwrap().put(ip, ());
         }
+        let span = tracing::Span::current();
 
         let metadata_id = stream
             .peer_info()
@@ -216,7 +225,9 @@ impl Downloader {
 
         let pieces = (metadata_size + 16383) / 16384; // 16KB per piece
         let mut torrent = Vec::new();
+        span.record("pieces", pieces);
         for i in 0..pieces {
+            span.record("cur_index", i);
             let request = UtMetadataMessage::Request { piece: i };
             let msg = BtMessage::Extended {
                 id: metadata_id,
@@ -266,11 +277,13 @@ impl Downloader {
         let mut sha1 = sha1::Sha1::new();
         sha1.update(&torrent);
         if sha1.finalize().as_slice() != hash.as_slice() {
+            warn!("Hash mismatch ?");
             return Err(BtError::UserDefined("Hash mismatch".into()));
         }
         return Ok(torrent);
     }
 
+    #[instrument(skip(self))]
     async fn download(self, hash: InfoHash, ip: SocketAddr) -> Result<Vec<u8>, BtError> {
         let info = self.make_handshake_info(hash, ip);
         // Try try utp first
@@ -296,7 +309,7 @@ impl Downloader {
             }
         };
         let this = self.clone();
-        let stream = BtStream::server_handshake(stream, |req| async move {
+        let stream = BtStream::server_handshake(stream, async move |req| {
             debug!("Handshake request: for hash {}", req.hash);
             if controller.has_metadata(req.hash) {
                 debug!("Already have metadata for {}", req.hash);
@@ -321,6 +334,7 @@ impl Downloader {
 
     }
 
+    #[instrument(skip_all, fields(proto = %proto, peer = %peer, encryption))]
     async fn handle_incoming<T: AsyncRead + AsyncWrite + Unpin>(self, proto: &'static str, stream: T, peer: SocketAddr) {
         // Try PE?
         let collect_hashes = || {
@@ -334,44 +348,41 @@ impl Downloader {
         let stream = match PeStream::server_handshake(stream, collect_hashes).await {
             Ok(stream) => {
                 if stream.has_encryption() { // Encrypted,
-                    debug!("{proto}: Got PE handshake from peer {peer}");
+                    debug!("Got PE handshake from peer");
                 }
                 stream
             }
             // This part, no importance
             Err(PeError::NetworkError(e)) => {
-                debug!("{proto}: Failed to pe handshake with peer {peer} network error: {e}");
+                debug!("Failed to pe handshake: network error: {e}");
                 return;
             }
             Err(PeError::InfoHashNotFound) => {
-                debug!("{proto}: Failed to pe handshake with peer {peer} info hash not found");
+                debug!("Failed to pe handshake: info hash not found");
                 return;
             }
             // Emm?, May our impl is wrong?, so use warn
             Err(PeError::HanshakeFailed) => {
-                warn!("{proto}: Failed to pe handshake with peer {peer} handshake failed");
+                warn!("Failed to pe handshake: handshake failed");
                 return;
             }
             // Err(pe) => {
-            //     debug!("{proto}: Failed to pe handshake with peer {peer} error: {pe}");
+            //     debug!("Failed to pe handshake with error: {pe}");
             //     return;
             // }
         };
-        let enc = if stream.has_encryption() {
-            " encrypted"
+        if stream.has_encryption() {
+            tracing::Span::current().record("encryption", "true");
         }
-        else {
-            ""
-        };
         match self.handle_incoming_impl(stream, peer).await {
             Ok(hash) => {
-                info!("{proto}{enc}: Successfully downloaded metadata of {hash} from peer: {peer}");
+                info!("Successfully downloaded metadata {hash}");
             }
             Err(BtError::InvalidProtocolString(str)) => {
-                warn!("{proto}{enc}: Invalid protocol string from peer: {peer}, str: {str:?}");
+                warn!("Invalid protocol string from peer: str: {str:?}");
             }
             Err(err) => { // Another error
-                debug!("{proto}{enc}: Failed to get any metadata from peer: {peer} error: {err}");
+                debug!("Failed to get any metadata from error: {err}");
             }
         }
         return;
@@ -382,7 +393,6 @@ impl Downloader {
         debug_assert!(self.inner.controller.get().is_some(), "Controller should be set");
         if self.is_self_ip(ip) {
             // Self, ignore it
-            info!("Ignore self ip {ip}");
             return;
         }
         

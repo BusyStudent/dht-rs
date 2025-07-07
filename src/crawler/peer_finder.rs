@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    bt::{AnnounceInfo, AnnounceResult, AnnounceTask, BtError, Event, TrackerError, TrackerManager}, 
+    bt::{AnnounceInfo, AnnounceResult, AnnounceTask, BtError, Event, TrackerError, TrackerManager, Tracker}, 
     dht::DhtSession, 
     InfoHash, PeerId
 };
@@ -18,7 +18,7 @@ use tokio::{
     net::UdpSocket,
     time,
 };
-use tracing::info;
+use tracing::{info, instrument};
 
 struct PeerFinderInner {
     dht_session: DhtSession, // The dht session we used to call get_peers
@@ -32,6 +32,8 @@ struct PeerFinderInner {
     max_retries: usize,
     bind_ip: SocketAddr,
     peer_id: PeerId, // For Tracker Announcement
+
+    // Status
 }
 
 #[derive(Clone)]
@@ -96,6 +98,14 @@ impl PeerFinder {
         }
     }
 
+    pub fn cancel_all(&self) {
+        let mut map = self.inner.pending.lock().unwrap();
+        for (_, handle) in map.drain() {
+            handle.abort();
+        }
+        self.notify_tasks_count_changed(0); // Notify the controller, the task count is 0
+    }
+
     pub fn set_controller(&self, callback: Weak<dyn PeerFinderController + Sync + Send>) {
         let _ = self.inner.controller.set(callback);
     }
@@ -156,6 +166,7 @@ impl PeerFinder {
         return Vec::new();
     }
 
+    #[instrument(skip(self))]
     async fn find_peers(self, hash: InfoHash) {
         let info = AnnounceInfo {
             hash: hash,
@@ -173,7 +184,7 @@ impl PeerFinder {
                 Ok(p) => p,
                 Err(_) => return, // May not happend
             };
-            info!("Finding peers for {}", hash);
+            info!("Finding peers");
             // 1. Find peers on tracker
             let mut peers = Vec::new();
             for item in task.announce().await {
@@ -183,7 +194,7 @@ impl PeerFinder {
             }
             peers.sort(); // Remove the duplicate
             peers.dedup();
-            info!("Found {} peers for {} on tracker", peers.len(), hash);
+            info!("Found {} peers for on tracker", peers.len());
             
             // 2. Find peers on dht if not enough
             if peers.len() < 50 {
@@ -210,11 +221,12 @@ impl PeerFinder {
     }
 }
 
+// impl Tracker for DhtSession {
+
+// }
+
 impl Drop for PeerFinder {
     fn drop(&mut self) {
-        let map = self.inner.pending.lock().unwrap();
-        for (_, handle) in map.iter() {
-            handle.abort();
-        }
+        self.cancel_all();
     }
 }

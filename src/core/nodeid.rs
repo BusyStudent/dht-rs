@@ -180,7 +180,7 @@ impl fmt::Display for NodeId {
 
 impl fmt::Debug for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        return write!(f, "NodeId({})", self.bin());
+        return write!(f, "{}", self.hex());
     }
 }
 

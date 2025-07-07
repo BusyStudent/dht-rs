@@ -641,6 +641,8 @@ impl utp_socket_t {
 
 unsafe impl Send for utp_context_t {}
 unsafe impl Send for utp_socket_t {}
+unsafe impl Sync for utp_context_t {}
+unsafe impl Sync for utp_socket_t {}
 
 #[cfg(test)]
 mod tests {

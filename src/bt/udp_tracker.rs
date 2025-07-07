@@ -2,6 +2,8 @@
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
 use tokio::sync::oneshot;
+use tracing::instrument;
+use tracing::Level;
 use tracing::{warn, trace};
 use async_trait::async_trait;
 use url::{Url, Host};
@@ -73,6 +75,7 @@ struct CancelGuard<'a> {
 }
 
 impl UdpTracker {
+    #[instrument(skip(sockfd, url), fields(url = %url))]
     pub async fn new(url: &Url, sockfd: Arc<UdpSocket>) -> Option<Self> {
         let local_addr = sockfd.local_addr().ok()?;
         if url.scheme() != "udp" {
@@ -96,7 +99,7 @@ impl UdpTracker {
         if addr.is_ipv4() != local_addr.is_ipv4() {
             return None;
         }
-        trace!("Tracker: {}, New for {}", url, addr);
+        trace!("Select address {}", addr);
         return Some(Self { inner: Arc::new(UdpTrackerInner {
             url: url.clone(),
             addr: addr,
@@ -120,12 +123,13 @@ impl UdpTracker {
     }
 
     // Do a connect request to the tracker and return the connection id
+    #[instrument(skip(self), fields(self.url = %self.inner.url))]
     async fn connect(&self) -> Result<u64, TrackerError> {
         // Connect Query
         // u64: protocol id
         // u32: action
         // u32: transaction id
-        trace!("Tracker: {}, Connecting to", self.inner.url);
+        trace!("Connecting to {}", self.peer_addr());
         let bytes = self.send_request(PROTOCOL_ID, Action::Connect, &[]).await?;
         let con_id = match bytes[..].try_into() {
             Err(_) => return Err(TrackerError::InvalidReply),
@@ -149,6 +153,7 @@ impl UdpTracker {
     } 
 
     // Get the connection id in the tracker, if already haven, return it, if not or expired, do a connect request
+    #[instrument(skip(self), ret, level = Level::TRACE)]
     async fn connection_id(&self) -> Result<u64, TrackerError> {
         let mut receiver = {
             let mut state = self.inner.con_state.lock().unwrap();
@@ -163,6 +168,7 @@ impl UdpTracker {
             match state.worker.as_ref() {
                 Some(sender) => sender.subscribe(),
                 None => {
+                    trace!("Start a connect worker");
                     let (tx, rx) = broadcast::channel(1);
                     tokio::spawn(self.clone().connect_worker(tx.clone()));
                     state.worker = Some(tx);
@@ -172,6 +178,7 @@ impl UdpTracker {
             }
         };
         // Wait for the connection id
+        trace!("Waiting for the connection id");
         return receiver.recv().await.map_err(|_| TrackerError::TimedOut)?;
     }
 
@@ -184,7 +191,8 @@ impl UdpTracker {
 
         let mut buf = Vec::new();
         let tid = self.inner.tid.fetch_add(1, Ordering::SeqCst);
-        
+        tracing::Span::current().record("tid", &tid); // For debug
+
         // u64: connection id (or protocol id for connect)
         // u32: action
         // u32: transaction id
@@ -196,7 +204,7 @@ impl UdpTracker {
         buf.extend_from_slice(data);
 
         // Request build done, now we send it
-        trace!("Tracker: {}, Sending request: {:?}, tid: {}", self.inner.url, action, tid);
+        trace!("Sending request to {}", self.peer_addr());
         let (tx, rx) = oneshot::channel();
         let mut guard = CancelGuard::new(tid, &self.inner);
         self.inner.pending.lock().unwrap().insert(tid, tx);
@@ -211,7 +219,7 @@ impl UdpTracker {
                 return Err(TrackerError::Unknown);
             },
         };
-        trace!("Tracker: {}, Got request: {:?}, tid: {}", self.inner.url, ret_action, tid);
+        trace!("Got request");
         // Done, async get the result, now we can remove the guard
         guard.disarm();
 
@@ -225,13 +233,18 @@ impl UdpTracker {
         return Ok(data);
     }
 
+    #[instrument(skip(self, data), fields(tid))]
     async fn send_request(&self, connection_id: u64, action: Action, data: &[u8]) -> Result<Vec<u8>, TrackerError> {
         match tokio::time::timeout(MAX_TIMEOUT, self.send_request_impl(connection_id, action, data)).await {
             Ok(val) => return val,
-            Err(_) => return Err(TrackerError::TimedOut),
+            Err(_) => {
+                warn!("Request Timeout");
+                return Err(TrackerError::TimedOut);
+            },
         }
     }
     
+    #[instrument(skip(self, data), fields(url = %self.inner.url))]
     pub fn process_udp(&self, data: &[u8], addr: &SocketAddr) -> bool {
         // Reply
         // u32: action
@@ -258,6 +271,7 @@ impl UdpTracker {
     }
 
     // Do the announce request to the tracker and return the list of peers
+    #[instrument(name = "announce", skip(self, info), fields(info.hash, url = %self.inner.url))]
     async fn announce_impl(&self, info: AnnounceInfo) -> Result<AnnounceResult, TrackerError> {
         // 20B: info_hash
         // 20B: peer_id
@@ -324,6 +338,7 @@ impl UdpTracker {
         });
     }
 
+    #[instrument(name = "scrape", skip(self), fields(url = %self.inner.url))]
     async fn scrape_impl(&self, hashes: &[InfoHash]) -> Result<HashMap<InfoHash, ScrapedItem>, TrackerError> {
         if hashes.len() > MAX_SCRAPE {
             return Err(TrackerError::MaxScrapeReached);
@@ -392,7 +407,7 @@ impl<'a> CancelGuard<'a> {
 impl<'a> Drop for CancelGuard<'a> {
     fn drop(&mut self) {
         if !self.disarm { // Cleanup when task was canceled
-            trace!("Tracker {} canceled task: {}", self.tracker.url, self.tid);
+            warn!("Tracker canceled task: {}", self.tid);
             self.tracker.pending.lock().unwrap().remove(&self.tid);
         }
     }

@@ -1,9 +1,8 @@
 #![allow(dead_code)] // Let it shutup!
 use std::collections::BTreeMap;
-use std::future::Future;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::io;
-use tracing::{trace, debug};
+use tracing::{debug, instrument, trace, Level};
 use thiserror::Error;
 use crate::bencode::Object;
 use crate::InfoHash;
@@ -189,8 +188,7 @@ mod utils {
             // Dump it
             let span = cursor[0..20].try_into().unwrap();
             #[cfg(debug_assertions)] { // Only dump in debug mode
-                let backtrace = std::backtrace::Backtrace::capture();
-                warn!("Invalid protocol string str: {:?}, backtrace: {:?}", span, backtrace);
+                warn!("Invalid protocol string str: {:?}", span);
             }
             return Err(BtError::InvalidProtocolString(span));
         }
@@ -287,9 +285,7 @@ impl PeerId {
     /// Random create an peer id
     pub fn rand() -> PeerId {
         let mut arr = [0u8; 20];
-        for i in &mut arr {
-            *i = fastrand::u8(..);
-        }
+        fastrand::fill(&mut arr);
         return PeerId::from(arr);
     }
 
@@ -482,6 +478,7 @@ impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
     /// `request`: The handshake request from remote
     /// 
     /// `info`: The handshake info of local
+    #[instrument(level = Level::TRACE, skip_all, fields(hash = %request.hash))]
     async fn build(mut stream: T, request: BtHandshakeRequest, info: BtHandshakeInfo) -> Result<BtStream<T> , BtError> {
         let mut read_buf = Vec::new();
         let mut write_buf = Vec::new();
@@ -526,10 +523,12 @@ impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
     }
 
     /// Handshake like an client
+    #[instrument(level = Level::TRACE, skip_all, fields(hash = %info.hash))]
     pub async fn client_handshake(mut stream: T, info: BtHandshakeInfo) -> Result<BtStream<T> , BtError> {
         utils::write_handshake(&mut stream, &info).await?;
         let request = utils::read_handshake(&mut stream).await?;
         if request.hash != info.hash { // Info Hash mismatch
+            trace!("Info hash mismatch {}", request.hash);
             return Err(BtError::InfoHashMismatch(request.hash));
         }
         return BtStream::build(stream, request, info).await;
@@ -538,8 +537,9 @@ impl<T> BtStream<T> where T: AsyncRead + AsyncWrite + Unpin {
     /// Handshake like an server, and call the callback to get the handshake info
     /// 
     /// `cb`: The async callback to get the handshake info, the result is Result<BtHandahakeInfo, BtError>
-    pub async fn server_handshake<F, Fut>(mut stream: T, cb: F) -> Result<BtStream<T> , BtError> 
-        where F: FnOnce(BtHandshakeRequest) -> Fut, Fut: Future<Output = Result<BtHandshakeInfo, BtError> >
+    #[instrument(level = Level::TRACE, skip_all)]
+    pub async fn server_handshake<F>(mut stream: T, cb: F) -> Result<BtStream<T> , BtError> 
+        where F: AsyncFnOnce(BtHandshakeRequest) -> Result<BtHandshakeInfo, BtError>
     {
         let request = utils::read_handshake(&mut stream).await?;
         let info = cb(request.clone()).await?;

@@ -240,19 +240,19 @@ impl PeerFinderController for CrawlerInner {
     fn on_tasks_count_changed(&self, count: usize) {
         let new = match count {
             c if c > 1000 => true,
-            c if c < 20 => false,
+            c if c < 800 => false,
             _ => return, // Middle, do nothing
         };
         let old = self.too_many_hash.swap(new, Ordering::Relaxed);
         if old != new {
             let msg = if new { 
-                "Too many hash, auto sample is disabled" 
+                format!("Too many hash {count}, auto sample is disabled") 
             } 
             else { 
-                "Hash count is normal, auto sample is enabled"
+                format!("Hash count {count} is normal, auto sample is enabled")
             };
-            self.controller.on_message(msg.into());
             info!("{msg}");
+            self.controller.on_message(msg);
         }
     }
 }

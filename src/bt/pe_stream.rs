@@ -50,8 +50,8 @@ pub struct PeStream<T> {
     init_payload: Vec<u8>,
     
     // Encryption state
-    decryptor: Option<Box<dyn StreamCipher + Send> >,
-    encryptor: Option<Box<dyn StreamCipher + Send> >,
+    decryptor: Option<Box<dyn StreamCipher + Send + Sync> >,
+    encryptor: Option<Box<dyn StreamCipher + Send + Sync> >,
     encryptor_buf: Vec<u8>,
     encryptor_buf_offset: usize,
 }

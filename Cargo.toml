@@ -10,7 +10,7 @@ color-backtrace = { version = "0.7" }
 ctor = "0.4.2"
 thiserror = "2.0.12"
 tracing = { version = "^0.1.41", features = ["log"] }
-tracing-subscriber = "0.3.19"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 sha1 = "0.10.6"
 axum = { version = "0.8.4", features = ["http2"] }
 serde = { version = "1.0.219", features = ["derive"] }
