@@ -316,6 +316,11 @@ impl RoutingTable {
         return self.ips.len(); // Use ips to count, it is more accurate
     }
 
+    /// Check the routing table is empty
+    pub fn is_empty(&self) -> bool {
+        return self.ips.is_empty()
+    }
+
     /// Iterate the nodes in the routing table, from the closest to the farest
     pub fn iter(&self) -> impl Iterator<Item = (NodeId, SocketAddr)> + '_ {
         let mut vec = Vec::new();

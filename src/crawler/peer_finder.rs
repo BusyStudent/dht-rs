@@ -123,30 +123,6 @@ impl PeerFinder {
         self.notify_tasks_count_changed(map.len());
     }
 
-    // async fn find_peers_on_tracker(&self, hash: InfoHash, guard: &mut TaskStateGuard) -> Vec<SocketAddr> {
-    //     let mut peers = Vec::new();
-
-    //     // Try to find peers on all the trackers
-    //     let trackers: Vec<UdpTracker> =  self.inner.trackers.read().unwrap().values().map(|f| f.clone()).collect();
-    //     for trakcer in trackers.iter() {
-    //         let result = self.clone().tracker_announce(trakcer.clone(), hash, Event::None).await;
-    //         info!("Got result from tracker");
-    //         match result {
-    //             Ok(result) => {
-    //                 info!("Found {} peers for {} on tracker", result.peers.len(), hash);
-    //                 // guard.add_tracker_announced(tracker); // Add the cleanup guard
-    //                 peers.extend_from_slice(&result.peers);
-    //             }
-    //             Err(e) => {
-    //                 info!("Failed to announce to tracker : {}", e);
-    //             }
-    //         }
-    //     }
-    //     peers.sort(); // Remove the duplicate
-    //     peers.dedup();
-    //     return peers;
-    // }
-
     async fn find_peers_on_dht(&self, hash: InfoHash) -> Vec<SocketAddr> {
         if let Ok(result) = self.inner.dht_session.clone().get_peers(hash).await {
             info!("Found {} peers for {} on DHT", result.peers.len(), hash);
@@ -168,40 +144,14 @@ impl PeerFinder {
 
     #[instrument(skip(self))]
     async fn find_peers(self, hash: InfoHash) {
-        let info = AnnounceInfo {
-            hash: hash,
-            peer_id: self.inner.peer_id,
-            port: self.inner.bind_ip.port(),
-            downloaded: 0,
-            uploaded: 0,
-            left: 1, // We need peers,
-            event: Event::Started,
-            num_want: None,
-        };
-        let mut task = AnnounceTask::new(self.inner.tracker_manager.clone(), info).await;
         for _ in 0..self.inner.max_retries {
             let premit = match self.inner.sem.acquire().await {
                 Ok(p) => p,
                 Err(_) => return, // May not happend
             };
             info!("Finding peers");
-            // 1. Find peers on tracker
-            let mut peers = Vec::new();
-            for item in task.announce().await {
-                for peer in item.peers.iter().filter(|addr| self.is_same_family(addr)) {
-                    peers.push(peer.clone());
-                }
-            }
-            peers.sort(); // Remove the duplicate
-            peers.dedup();
-            info!("Found {} peers for on tracker", peers.len());
-            
-            // 2. Find peers on dht if not enough
-            if peers.len() < 50 {
-                peers.extend_from_slice(&self.find_peers_on_dht(hash).await);
-                peers.sort(); // Remove the duplicate
-                peers.dedup();
-            }
+            // 1. Find peers on dht if not enough
+            let peers = self.find_peers_on_dht(hash).await;
             if let Some(controller) = self.inner.controller.wait().upgrade() {
                 if !peers.is_empty() {
                     controller.on_peers_found(hash, peers);
@@ -220,10 +170,6 @@ impl PeerFinder {
         self.notify_tasks_count_changed(map.len());
     }
 }
-
-// impl Tracker for DhtSession {
-
-// }
 
 impl Drop for PeerFinder {
     fn drop(&mut self) {

@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, HashMap};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
-use tokio::{task::JoinSet, sync::RwLock};
+use tokio::{task::JoinSet, sync::{RwLock, RwLockReadGuard, RwLockWriteGuard}};
 use tracing::{debug, error, info, instrument, span, trace, warn, Instrument, Level};
 use thiserror::Error;
 use async_trait::async_trait;
@@ -20,7 +20,7 @@ const MAX_ALPHA: usize = 10; // Use more cocorrent requests, to speed up the pro
 const MAX_PEERS: usize = 100; // The max peers we can get from the get_peers
 
 struct DhtSessionInner {
-    routing_table: Mutex<RoutingTable>,
+    routing_table: RwLock<RoutingTable>,
     peers: RwLock<BTreeMap<InfoHash, BTreeSet<SocketAddr> > >, // The peers we know about, indexed by infohash
     krpc: KrpcContext,
     id: NodeId, // The self id
@@ -100,12 +100,12 @@ impl DhtSession {
         }
     }
 
-    fn routing_table_mut(&self) -> MutexGuard<'_, RoutingTable> {
-        return self.inner.routing_table.lock().expect("Mutex poisoned");
+    async fn routing_table_mut(&self) -> RwLockWriteGuard<'_, RoutingTable> {
+        return self.inner.routing_table.write().await;
     }
 
-    pub fn routing_table(&self) -> MutexGuard<'_, RoutingTable> {
-        return self.inner.routing_table.lock().expect("Mutex poisoned");
+    pub async fn routing_table(&self) -> RwLockReadGuard<'_, RoutingTable> {
+        return self.inner.routing_table.read().await;
     }
 
     pub fn new(id: NodeId, krpc: KrpcContext) -> Self {
@@ -113,7 +113,7 @@ impl DhtSession {
         return Self {
             inner: Arc::new(
                 DhtSessionInner {
-                    routing_table: Mutex::new(RoutingTable::new(id)),
+                    routing_table: RwLock::new(RoutingTable::new(id)),
                     peers: RwLock::new(BTreeMap::new()),
                     krpc: krpc,
                     id: id,
@@ -145,11 +145,11 @@ impl DhtSession {
             if let Err(e) = &result {
                 trace!("KRPC request failed for {}: {}", ip, e);
                 if !id.is_zero() { // We known the id, mark it as bad
-                    self.routing_table_mut().node_timeout(id);
+                    self.routing_table_mut().await.node_timeout(id);
                 }
             }
             else if !id.is_zero() { // is OK, we need to update it in routing table
-                let _ = self.routing_table_mut().update_node(id, &ip);
+                let _ = self.routing_table_mut().await.update_node(id, &ip);
             }
             return (result, ip); // Done
         }
@@ -204,7 +204,7 @@ impl DhtSession {
                 }
             };
             // Try add it to the routing table, it give us reply
-            let _ = self.routing_table_mut().add_node(reply.id, &ip);
+            let _ = self.routing_table_mut().await.add_node(reply.id, &ip);
             visited.insert(ip);
 
             // Update the nodes...
@@ -308,7 +308,7 @@ impl DhtSession {
                 }
             };
             // Try add it to the routing table, it give us reply
-            let _ = self.routing_table_mut().add_node(reply.id, &ip);
+            let _ = self.routing_table_mut().await.add_node(reply.id, &ip);
             visited.insert(ip, reply.token);
 
             // Update the nodes...
@@ -381,7 +381,7 @@ impl DhtSession {
     #[instrument(skip(self))]
     pub async fn find_node(self, target: NodeId) -> Result<Vec<NodeEndpoint>, FindNodeError> {
         // Get the nodes from routing table
-        let queue = self.routing_table_mut().find_node(target);
+        let queue = self.routing_table().await.find_node(target);
         if queue.is_empty() {
             warn!("No nodes found in the routing table when finding node");
         }
@@ -391,7 +391,7 @@ impl DhtSession {
     /// Get the peers for the given infohash, return the peers and the K-nearest nodes
     #[instrument(skip(self))]
     pub async fn get_peers(self, hash: InfoHash) -> Result<GetPeersResult, GetPeersError> {
-        let queue = self.routing_table_mut().find_node(hash);
+        let queue = self.routing_table_mut().await.find_node(hash);
         if queue.is_empty() {
             warn!("No nodes found in the routing table when getting peers");
         }
@@ -467,13 +467,13 @@ impl DhtSession {
                 let _ = self.inner.krpc.send_reply(tid, reply, ip).await;
 
                 query.id
-            },
+            }
             b"find_node" => {
                 let query = match FindNodeQuery::from_bencode(msg) {
                     Some(val) => val,
                     None => return false,
                 };
-                let nodes = self.routing_table_mut().find_node(query.target);
+                let nodes = self.routing_table().await.find_node(query.target);
                 let reply = FindNodeReply {
                     id: self.inner.id,
                     nodes: nodes,
@@ -481,7 +481,7 @@ impl DhtSession {
                 let _ = self.inner.krpc.send_reply(tid, reply, ip).await;
 
                 query.id
-            },
+            }
             b"get_peers" => {
                 let query = match GetPeersQuery::from_bencode(msg) {
                     Some(val) => val,
@@ -489,7 +489,7 @@ impl DhtSession {
                 };
                 // Find the infohash in the routing table and collect the peers if exists
                 let mut values = Vec::new();
-                let nodes = self.routing_table_mut().find_node(query.info_hash);
+                let nodes = self.routing_table().await.find_node(query.info_hash);
                 if let Some(peers) = self.inner.peers.read().await.get(&query.info_hash) {
                     for peer in peers {
                         values.push(peer.clone());
@@ -509,7 +509,7 @@ impl DhtSession {
                 let _ = self.inner.krpc.send_reply(tid, reply, ip).await;
 
                 query.id
-            },
+            }
             b"announce_peer" => {
                 let query = match AnnouncePeerQuery::from_bencode(msg) {
                     Some(val) => val,
@@ -547,7 +547,34 @@ impl DhtSession {
                 }
 
                 query.id
-            },
+            }
+            b"sample_infohashes" => {
+                let query = match SampleInfoHashesQuery::from_bencode(msg) {
+                    Some(val) => val,
+                    None => return false,
+                };
+                let (hashes, len) = {
+                    let peers = self.inner.peers.read().await;
+                    let hashes = peers.keys()
+                        .filter(|_| fastrand::bool())
+                        .take(50) // InfoHashes are 20 bytes, so 50 hashes is 1000 bytes, avoid out of MTU
+                        .cloned()
+                        .collect();
+
+                    (hashes, peers.len())
+                };
+                let nodes = self.routing_table().await.find_node(query.target);
+                let reply = SampleInfoHashesReply {
+                    id: self.inner.id,
+                    interval: 1800,
+                    nodes: nodes,
+                    num: len as u32,
+                    info_hashes: hashes,
+                };
+
+                let _ = self.inner.krpc.send_reply(tid, reply, ip).await;
+                return true; // Direct return, avoid we sample self
+            }
             _ => {
                 error!("Unknown method: {}", String::from_utf8_lossy(method));
                 let reply = ErrorReply {
@@ -556,10 +583,10 @@ impl DhtSession {
                 };
                 let _ = self.inner.krpc.send_reply(tid, reply, ip).await;
                 return true; // Unknown method, but still a valid query for process udp
-            },
+            }
         };
         trace!("Received query method {} from {}: {} ", String::from_utf8_lossy(method), id, ip);
-        let _ = self.routing_table_mut().update_node(id, ip);
+        let _ = self.routing_table_mut().await.update_node(id, ip);
 
         // Notify the observer if exists
         if let Some(observer) = self.inner.observer.get().and_then(|o| o.upgrade()) {
@@ -580,7 +607,7 @@ impl DhtSession {
             "router.utorrent.com:6881",
         ];
         // Use the nodes from routing table as init queue (emm, default is 0 nodes)
-        let mut queue: Vec<NodeEndpoint> = self.routing_table_mut().iter().collect();
+        let mut queue: Vec<NodeEndpoint> = self.routing_table().await.iter().collect();
         for each in routers {
             let res = match tokio::net::lookup_host(each).await {
                 Ok(res) => res,
@@ -589,7 +616,7 @@ impl DhtSession {
                     continue; // Skip this router if lookup fails
                 }
             };
-            let mut table = self.routing_table_mut();
+            let mut table = self.routing_table_mut().await;
             for ip in res {
                 table.add_router(&ip); // Add this ip as router, to filter 
                 if self.is_native_addr(&ip) {
@@ -606,7 +633,7 @@ impl DhtSession {
                 return false;
             }
         };
-        let mut len = self.routing_table_mut().nodes_len();
+        let mut len = self.routing_table().await.nodes_len();
         let mut iter = 0;
         if len == 0 {
             // Emm, we have no nodes in the routing table, let run retry
@@ -614,14 +641,14 @@ impl DhtSession {
         }
         while len <= 20 && iter < 10 { // Doing random search to fill our bucket
             let id = NodeId::rand();
-            let nodes = self.routing_table_mut().find_node(id);
+            let nodes = self.routing_table().await.find_node(id);
             if nodes.is_empty() {
                 // No nodes found, try again
                 iter += 1;
                 continue;
             }
             let _ = self.find_node_impl(nodes, id).await;
-            len = self.routing_table_mut().nodes_len();
+            len = self.routing_table().await.nodes_len();
             iter += 1;
         }
         return true;
@@ -632,11 +659,11 @@ impl DhtSession {
     async fn refresh_routing_table(&self) {
         loop {
             let mut ping_set = JoinSet::new();
-            if self.routing_table_mut().nodes_len() < 8 {
+            if self.routing_table().await.nodes_len() < 8 {
                 // Not enough nodes, try to bootstrap again
                 return;
             }
-            while let Some((id, ip, duration)) = self.routing_table_mut().next_refresh_node(MIN_REFRESH_INTERVAL) {
+            while let Some((id, ip, duration)) = self.routing_table_mut().await.next_refresh_node(MIN_REFRESH_INTERVAL) {
                 debug!("Refreshing node {} at {}, last seen in {:?}", id, ip, duration);
                 let query = PingQuery {
                     id: self.inner.id
@@ -647,7 +674,7 @@ impl DhtSession {
 
             // Get the buckets indexes which node.len() < K / 2, refresh them
             let mut refresh_set = JoinSet::new();
-            for i in self.routing_table_mut().less_node_buckets_indexes(8 / 2) { // Less than HALF K
+            for i in self.routing_table().await.less_node_buckets_indexes(8 / 2) { // Less than HALF K
                 // We need to fill the empty buckets, so we can find more nodes
                 let span = span!(Level::DEBUG, "refresh_bucket", index = i);
                 debug!("Refreshing bucket at index {}", i);
@@ -659,7 +686,7 @@ impl DhtSession {
             // Sleep for a while before next refresh
             tokio::time::sleep(MIN_REFRESH_INTERVAL).await;
             // debug dump the routing table
-            debug!("Refresh done, routing table {:?}", self.routing_table_mut());
+            debug!("Refresh done, routing table {:?}", self.routing_table().await);
         }
     }
 

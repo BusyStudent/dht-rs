@@ -78,8 +78,8 @@ const MAX_SEARCH_PER_PAGES: usize = 25;
 impl CrawlerController for AppInner {
     fn on_info_hash_found(&self, _hash: InfoHash) {
         // info!("Found a new info hash: {}", hash); // On Console!
-        let msg = format!("Found a new info hash: {}", _hash);
-        let _ = self.broadcast.send(Some(msg)); // On WebUI!
+        // let msg = format!("Found a new info hash: {}", _hash);
+        // let _ = self.broadcast.send(Some(msg)); // On WebUI!
     }
 
     fn has_metadata(&self, hash: InfoHash) -> bool {
@@ -117,11 +117,12 @@ impl App {
         }
 
         // Try to load config from the disk
-        let config = match fs::read_to_string("./data/config.json") {
-            Ok(content) => {
-                serde_json::from_str(&content).expect("Can not read the config from the disk")
-            },
-            Err(_) => {
+        let result = fs::read_to_string("./data/config.json")
+            .ok()
+            .and_then(|content| serde_json::from_str(&content).ok() );
+        let config = match result  {
+            Some(val) => val,
+            None => {
                 // Using default config
                 Config {
                     webui_addr: "127.0.0.1:10721".parse().unwrap(), // Ciallo～(∠・ω< )
@@ -134,7 +135,7 @@ impl App {
                     // Trackers
                     trackers: Vec::new(),
                 }
-            },
+            }
         };
         let (sx, _) = broadcast::channel(100);
         
@@ -152,8 +153,18 @@ impl App {
 
     pub async fn run(&self) {
         let router = Router::new()
+            // Static files
             .route("/", get(|| async {
                 return Html(include_str!("../static/index.html"));
+            }))
+            .route("/styles.css", get(|| async {
+                let mut header = HeaderMap::new();
+                header.insert("Content-Type", "text/css".parse().unwrap());
+                
+                return (header, include_str!("../static/styles.css"));
+            }))
+            .route("/script.js", get(|| async {
+                return include_str!("../static/script.js");
             }))
 
             // Basic API
@@ -312,23 +323,25 @@ impl App {
 
     // Info Query
     async fn get_routing_table_handler(State(app): State<App>) -> impl IntoResponse {
-        let mtx = app.inner.crawler.lock().unwrap();
-        let cralwer = match &*mtx {
-            Some((cralwer, _)) => cralwer,
-            None => return String::from("[]"),
+        let crawler = {
+            let mtx = app.inner.crawler.lock().unwrap();
+            match &*mtx {
+                Some((crawler, _)) => crawler.clone(),
+                None => return Json(json!([])),
+            }
         };
-        let nodes: Vec<(NodeId, SocketAddr)> = cralwer.dht_session().routing_table().iter().collect();
-        if nodes.is_empty() {
-            return String::from("[]");
+        let table = crawler.dht_session().routing_table().await;
+        if table.is_empty() {
+            return Json(json!([]));
         }
         let mut list = Vec::new();
-        for (node_id, ip) in nodes {
+        for (node_id, ip) in table.iter() {
             list.push(json!({
                 "id": node_id.hex(),
                 "ip": ip,
             }));
         }
-        return json!(list).to_string();
+        return Json(json!(list));
     }
 
     // Config
