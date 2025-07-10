@@ -1,7 +1,8 @@
 #![allow(dead_code)] // Let it shutup!
 use rusqlite::{Connection, params, Result};
-use std::sync::Mutex;
 use serde::{Serialize, Deserialize};
+use tracing::error;
+use std::{sync::Mutex};
 
 use crate::{Torrent, InfoHash};
 
@@ -47,11 +48,14 @@ impl Storage {
             hash: torrent.info_hash(),
             name: torrent.name().into(),
             size: torrent.length(),
-            files: torrent.files().into_iter().map(|(name, size)| {
-                return TorrentFile {
+            files: torrent.files().into_iter().filter_map(|(name, size)| {
+                if name.contains("_____padding_file_") || name.contains(".____padding_file_") { // Junk files
+                    return None;
+                }
+                return Some(TorrentFile {
                     name: name,
                     size: size
-                }
+                });
             }).collect()
         };
         let files = serde_json::to_string(&info.files).unwrap();
@@ -88,6 +92,17 @@ impl Storage {
         let mut stmt = conn.prepare("SELECT 1 FROM torrents WHERE hash = ?1")?;
         let mut rows = stmt.query(params![hash.as_slice()])?;
         return Ok(rows.next()?.is_some());
+    }
+
+    /// Get the number of torrents in the database
+    pub fn torrents_len(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM torrents")?;
+        let mut rows = stmt.query(params![])?;
+        let row = rows.next()?.unwrap();
+        let count = row.get(0)?;
+
+        return Ok(count);
     }
 
     /// Search the torrent from the database
@@ -165,7 +180,14 @@ impl Storage {
             let size: u64 = row.get(2)?;
             let files_json: String = row.get(3)?;
 
-            let files: Vec<TorrentFile> = serde_json::from_str(files_json.as_str()).expect("It should never failed");
+            let files: Vec<TorrentFile> = match serde_json::from_str(files_json.as_str()) {
+                Ok(val) => val,
+                Err(e) => {
+                    error!("Error parsing torrent files: {}, database CORRUPTED???", e);
+                    total -= 1; // Skip this row
+                    continue;
+                }
+            };
 
             torrents.push(TorrentInfo {
                 hash: InfoHash::from(hash),

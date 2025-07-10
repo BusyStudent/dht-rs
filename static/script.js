@@ -4,10 +4,21 @@ const MAX_LOG_LINES = 1000;
 // --- 全局变量和初始化 ---
 let searchDebounceTimer; // 用于搜索防抖的计时器
 let routingTableTimer;   // 用于更新路由表的计时器
+let dashboardTimer;      // 用于更新仪表盘的计时器
 let currentQuery = '';   // 当前搜索的关键词
 let currentPage = 1;     // 当前搜索的页码
 
+// [新增] 模块化仪表盘状态管理
+const dashboard = {
+    chartInstance: null,
+    // 用于生成连续模拟数据
+    mockDataHistory: {
+        metadataCount: 500, 
+    }
+};
+
 loadSettings();
+initDashboard(); // 初始化仪表盘模块
 addLog("欢迎使用 DHT Indexer 控制面板。");
 addLog("前端界面已就绪，等待与后端交互。");
 setupEventListeners();
@@ -133,8 +144,94 @@ function setupEventListeners() {
 function setupEventSource() {
     const eventSource = new EventSource('/api/v1/sse/events'); // 连接到 SSE 端点
     eventSource.onmessage = (event) => {
-        addLog(event.data);
+        try {
+            processEvent(event);
+        }
+        catch (error) {
+            console.log('Error parsing SSE message:', error);
+        }
     };
+}
+
+// --- [重构] 仪表盘模块 ---
+
+/**
+ * 初始化仪表盘，包括创建图表
+ * 这是模块化的一部分，将所有仪表盘相关的初始化放在一起
+ */
+function initDashboard() {
+    const ctx = document.getElementById('metadata-chart').getContext('2d');
+    
+    dashboard.chartInstance = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [], // X轴，时间
+            datasets: [{
+                label: '抓取的元数据数量',
+                data: [], // Y轴，数量
+                backgroundColor: 'rgba(52, 152, 219, 0.2)',
+                borderColor: 'rgba(52, 152, 219, 1)',
+                borderWidth: 2,
+                fill: true,
+                tension: 0.4 // 使线条平滑
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                y: {
+                    beginAtZero: false // Y轴不一定从0开始，更好地显示变化
+                },
+                x: {
+                    ticks: {
+                        maxRotation: 0,
+                        minRotation: 0,
+                        autoSkip: true,
+                        maxTicksLimit: 10 // X轴最多显示10个标签，防止拥挤
+                    }
+                }
+            },
+            plugins: {
+                legend: {
+                    display: false // 只有一个数据集，可以隐藏图例
+                }
+            }
+        }
+    });
+}
+
+
+/**
+ * 更新仪表盘的 UI 显示 (卡片和图表)
+ * @param {object} data - 包含仪表盘数据的对象
+ * @example updateDashboardUI({ nodes: 1234, infohashes: 5678, metadata: 910, peers: 112 })
+ */
+function updateDashboardUI(data) {
+    // 1. 更新统计卡片
+    document.getElementById('stat-nodes').textContent = data.nodes;
+    document.getElementById('stat-infohashes').textContent = data.infohashes;
+    document.getElementById('stat-metadata').textContent = data.metadata;
+    document.getElementById('stat-peers').textContent = data.peers;
+    document.getElementById('stat-fetching').textContent = data.fetching;
+
+    // 2. 更新图表
+    const chart = dashboard.chartInstance;
+    const now = new Date().toLocaleTimeString();
+
+    // 添加新数据
+    chart.data.labels.push(now);
+    chart.data.datasets[0].data.push(data.metadata);
+
+    // 限制图表显示的数据点数量，防止无限增长
+    const maxDataPoints = 30; 
+    if (chart.data.labels.length > maxDataPoints) {
+        chart.data.labels.shift(); // 移除最旧的标签
+        chart.data.datasets[0].data.shift(); // 移除最旧的数据
+    }
+
+    // 调用 chart.js 的 update 方法来重绘图表
+    chart.update();
 }
 
 // --- 与后端交互的函数 ---
@@ -273,6 +370,26 @@ function addLog(message) {
     // 只有在添加日志前视图就在底部时，才自动滚动到底部
     if (isScrolledToBottom) {
         logWindow.scrollTop = logWindow.scrollHeight;
+    }
+}
+
+function processEvent(event) {
+    const json = JSON.parse(event.data);
+    switch (json['type']) {
+        case 'log': 
+            addLog(json['data']);
+            break;
+        case 'downloaded':
+            const hash = json['data']['hash'];
+            const name = json['data']['name'];
+            addLog(`下载到元数据 ${name}`);
+            break;
+        case 'dashboard':
+            updateDashboardUI(json['data']);
+            break;
+        default:
+            console.log('Unknown event type:', json['type']);
+            break
     }
 }
 

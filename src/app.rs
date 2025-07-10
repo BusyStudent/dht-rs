@@ -91,20 +91,31 @@ impl CrawlerController for AppInner {
     }
 
     fn on_message(&self, message: String) {
-        let _ = self.broadcast.send(Some(message)); // On WebUI!
+        let json = json!({
+            "type": "log",
+            "data": message
+        });
+        let _ = self.broadcast.send(Some(json.to_string())); // On WebUI!
     }
 
-    fn on_metadata_downloaded(&self, _hash: InfoHash, data: Vec<u8>) {
+    fn on_metadata_downloaded(&self, hash: InfoHash, data: Vec<u8>) {
         let torrent = match Torrent::from_info_bytes(&data) {
             None => { // Save it to the disk
-                warn!("Can not parse the torrent, save {} it to the disk", _hash);
-                let mut file = fs::File::create(format!("./data/{}.torrent", _hash)).unwrap();
+                warn!("Can not parse the torrent, save {} it to the disk", hash);
+                let mut file = fs::File::create(format!("./data/{}.torrent", hash)).unwrap();
                 let _ = file.write_all(&data);
                 return;
             }
             Some(val) => val,
         };
-        let _ = self.broadcast.send(Some(format!("Downloaded a new torrent: {}", torrent.name()))); // On WebUI!
+        let json = json!({
+            "type": "downloaded",
+            "data": {
+                "hash": hash,
+                "name": torrent.name(),
+            }
+        });
+        let _ = self.broadcast.send(Some(json.to_string())); // On WebUI!
         let _ = self.storage.add_torrent(&torrent);
     }
 }
@@ -537,15 +548,38 @@ impl App {
         let mut rx = app.inner.broadcast.subscribe();
         let stream = async_stream::stream! {
             loop {
-                match rx.recv().await {
-                    Ok(Some(msg)) => {
-                        yield Ok(Event::default().data(&msg));
+                tokio::select! {
+                    val = rx.recv() => { // Has some message from another component
+                        match val {
+                            Ok(Some(msg)) => {
+                                yield Ok(Event::default().data(msg));
+                            }
+                            Ok(None) => {
+                                return; // We are shutting down
+                            }
+                            Err(_) => {
+                                break;
+                            }
+
+                        }
                     }
-                    Ok(None) => {
-                        return; // We are shutting down
-                    }
-                    Err(_) => {
-                        break;
+                    _ = tokio::time::sleep(Duration::from_millis(1500)) => { // Update Dashboard
+                        let crawler = match app.inner.crawler.lock().unwrap().as_ref() {
+                            None => continue, // No crawler, we didn't update the dashboard
+                            Some((crawler, _)) => crawler.clone(),
+                        };
+                        let status = crawler.status().await;
+                        let json = json!({
+                            "type": "dashboard",
+                            "data": {
+                                "nodes": status.nodes_count,
+                                "infohashes": status.hashes_count,
+                                "peers": status.connections_count,
+                                "fetching": status.pending_count,
+                                "metadata": app.inner.storage.torrents_len().unwrap_or(0),
+                            }
+                        });
+                        yield Ok(Event::default().data(json.to_string()));
                     }
                 }
             }

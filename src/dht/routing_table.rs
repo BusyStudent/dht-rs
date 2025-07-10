@@ -243,7 +243,7 @@ impl RoutingTable {
                 },
                 NodeStatus::Bad => {
                     // info!("Node {} is timeout, and bad, remove it", node.id);
-                    bucket.nodes.remove(pos);
+                    self.remove_node(target);
                 },
             }
         }

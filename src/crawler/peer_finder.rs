@@ -99,11 +99,17 @@ impl PeerFinder {
     }
 
     pub fn cancel_all(&self) {
+        info!("Canceling all peer finding tasks");
         let mut map = self.inner.pending.lock().unwrap();
         for (_, handle) in map.drain() {
             handle.abort();
         }
         self.notify_tasks_count_changed(0); // Notify the controller, the task count is 0
+    }
+
+    /// Get the number of pending tasks
+    pub fn pending_len(&self) -> usize {
+        return self.inner.pending.lock().unwrap().len();   
     }
 
     pub fn set_controller(&self, callback: Weak<dyn PeerFinderController + Sync + Send>) {
@@ -127,16 +133,6 @@ impl PeerFinder {
         if let Ok(result) = self.inner.dht_session.clone().get_peers(hash).await {
             info!("Found {} peers for {} on DHT", result.peers.len(), hash);
             // If peers it not enough, announce the peers
-            if result.peers.len() < 50 {
-                // Begin announcing the peers
-                let mut set = JoinSet::new();
-                for node in result.nodes {
-                    set.spawn(
-                        self.inner.dht_session.clone().announce_peer(node.ip, hash, None, node.token)
-                    );
-                }
-                let _ = set.join_all().await;
-            }
             return result.peers;
         }
         return Vec::new();
@@ -168,11 +164,5 @@ impl PeerFinder {
        
         map.remove(&hash);
         self.notify_tasks_count_changed(map.len());
-    }
-}
-
-impl Drop for PeerFinder {
-    fn drop(&mut self) {
-        self.cancel_all();
     }
 }

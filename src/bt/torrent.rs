@@ -1,4 +1,3 @@
-#![allow(dead_code)] // Let it shutup!
 use crate::bencode::Object;
 use crate::InfoHash;
 use sha1::{Sha1, Digest};
@@ -47,9 +46,8 @@ impl Torrent {
     pub fn info_hash(&self) -> InfoHash {
         let info = self.info_checked().unwrap(); // Using unwrap because we already checked it in from()
         let encoded = info.encode();
-        let hash = Sha1::digest(&encoded);
-        let array: [u8; 20] = hash.try_into().unwrap();
-        return InfoHash::from(array);
+        let hash: [u8; 20] = Sha1::digest(&encoded).into();
+        return InfoHash::from(hash);
     }
 
     /// Get the name of the torrent
@@ -97,7 +95,11 @@ impl Torrent {
     }
 
     fn name_checked(&self) -> Option<&str> {
-        let name = self.info_checked()?.get(b"name")?.as_string()?.as_slice();
+        let info = self.info_checked()?;
+        let name = info
+            .get(b"name.utf-8") // Historical issues :(
+            .or_else(|| info.get(b"name"))?
+            .as_string()?;
         match std::str::from_utf8(name) {
             Ok(val) => return Some(val),
             Err(_) => return None,
@@ -124,8 +126,13 @@ impl Torrent {
         let files = self.info_checked()?.get(b"files")?.as_list()?;
         let mut vec = Vec::new();
         for file in files {
-            let paths = file.get(b"path")?.as_list()?;
-            let length = file.get(b"length")?.as_int()?;
+            let length = file
+                .get(b"length")?
+                .as_int()?;
+            let paths = file
+                .get(b"path.utf-8")
+                .or_else(|| file.get(b"path"))?
+                .as_list()?;
             let mut path = String::new();
 
             for path_obj in paths {
@@ -154,6 +161,7 @@ impl Torrent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs::File, io::Read};
 
     #[test]
     fn test_torrent_basic() {
@@ -168,5 +176,18 @@ mod tests {
         assert_eq!(torrent.name(), "test.txt");
         assert_eq!(torrent.piece_length(), 16384);
         assert_eq!(torrent.length(), 1000);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_local_file() {
+        let mut file = File::open("./data/torrents/4ce5c1ec28454f6f0e5c009e74df3a62a9efafa8.torrent").unwrap(); // Why this file is not working?
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).unwrap();
+
+        let object = Object::parse(&buf).unwrap();
+        tracing::trace!("{:?}", object);
+        let torrent = Torrent::from(object).unwrap();
+        tracing::trace!("{:?}", torrent);
     }
 }

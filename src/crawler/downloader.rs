@@ -17,7 +17,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, instrument, warn};
 use std::{
     net::{SocketAddr, IpAddr},
-    sync::{Arc, Mutex, Weak, OnceLock, RwLock, atomic::AtomicU64},
+    sync::{Arc, Mutex, Weak, OnceLock, RwLock, atomic::{AtomicUsize, Ordering}},
     collections::HashMap,
     time::Duration,
 };
@@ -40,16 +40,16 @@ struct DownloaderInner {
     
     // Config
     peer_id: PeerId,
-    bind_ip: SocketAddr,
+    bind_ip: Option<SocketAddr>,
 
     // Status
-    connections: AtomicU64,
+    connections: AtomicUsize,
 }
 
 pub struct DownloaderConfig {
     pub utp_context: UtpContext,
     pub peer_id: PeerId,
-    pub bind_ip: SocketAddr,
+    pub bind_ip: Option<SocketAddr>,
 }
 
 pub trait DownloaderController {
@@ -67,6 +67,10 @@ struct CancelGuard {
     sender: watch::Sender<bool>
 }
 
+struct ConenctionWatcher {
+    inner: Arc<DownloaderInner>,
+}
+
 impl Downloader {
     // Create an downloader
     pub fn new(config: DownloaderConfig) -> Self {
@@ -82,7 +86,7 @@ impl Downloader {
             utp_context: config.utp_context,
             peer_id: config.peer_id,
             bind_ip: config.bind_ip,
-            connections: AtomicU64::new(0),
+            connections: AtomicUsize::new(0),
         })};
         return downloader;
     }
@@ -94,7 +98,15 @@ impl Downloader {
         self.inner.cancel_watch.set(rx).unwrap(); // Set the cancel watch for the worker
 
         // Begin Listen
-        tokio::join!(self.utp_listener_main(), self.tcp_listener_main() );
+        if self.inner.bind_ip.is_some() { // If bind ip is set, we process incoming
+            tokio::join!(self.utp_listener_main(), self.tcp_listener_main());
+        }
+        else {
+            // Wait until cancel
+            loop {
+                let _ = tokio::time::sleep(Duration::from_secs(114514)).await;
+            }
+        }
     }
 
     fn make_handshake_info(&self, hash: InfoHash, peer_addr: SocketAddr) -> BtHandshakeInfo {
@@ -128,7 +140,7 @@ impl Downloader {
     }
 
     async fn tcp_listener_main(&self) {
-        let listener = match TcpListener::bind(&self.inner.bind_ip).await {
+        let listener = match TcpListener::bind(&self.inner.bind_ip.unwrap()).await {
             Ok(val) => val,
             Err(e) => {
                 error!("Failed to use TcpListener::bind() => {e}");
@@ -285,6 +297,7 @@ impl Downloader {
 
     #[instrument(skip(self))]
     async fn download(self, hash: InfoHash, ip: SocketAddr) -> Result<Vec<u8>, BtError> {
+        let _watch = ConenctionWatcher::new(&self);
         let info = self.make_handshake_info(hash, ip);
         // Try try utp first
         debug!("Utp: Connecting to {ip} for hash {hash}");
@@ -336,6 +349,7 @@ impl Downloader {
 
     #[instrument(skip_all, fields(proto = %proto, peer = %peer, encryption))]
     async fn handle_incoming<T: AsyncRead + AsyncWrite + Unpin>(self, proto: &'static str, stream: T, peer: SocketAddr) {
+        let _watch = ConenctionWatcher::new(&self);
         // Try PE?
         let collect_hashes = || {
             let hashes = self.inner.hashes.lock().unwrap();
@@ -447,9 +461,29 @@ impl Downloader {
         self.inner.hashes.lock().unwrap().pop(&hash);
     }
 
+    /// Get the current connected peers
+    pub fn connections(&self) -> usize {
+        return self.inner.connections.load(Ordering::Relaxed);
+    }
+
     /// Set the controller
     pub fn set_controller(&self, controller: Weak<dyn DownloaderController + Send + Sync>) {
         let _ = self.inner.controller.set(controller);
+    }
+}
+
+impl ConenctionWatcher {
+    fn new(downloader: &Downloader) -> Self {
+        downloader.inner.connections.fetch_add(1, Ordering::Relaxed);
+        return Self {
+            inner: downloader.inner.clone(),
+        };
+    }
+}
+
+impl Drop for ConenctionWatcher {
+    fn drop(&mut self) {
+        self.inner.connections.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

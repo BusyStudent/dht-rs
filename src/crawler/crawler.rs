@@ -12,7 +12,7 @@ use crate::{
     InfoHash, NodeId,
 };
 use std::{
-    collections::BTreeSet, io, net::SocketAddr, num::NonZero, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, MutexGuard}
+    collections::{BTreeSet, HashMap}, io, net::SocketAddr, num::NonZero, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, MutexGuard}
 };
 use async_trait::async_trait;
 use tokio::{net::UdpSocket, sync::{Semaphore, mpsc}, task::JoinSet};
@@ -47,6 +47,13 @@ pub struct CrawlerConfig {
     pub hash_lru_cache_size: NonZero<usize>,
     pub controller: Arc<dyn CrawlerController + Send + Sync>,
     pub trackers: Vec<String>,
+}
+
+pub struct CrawlerStatus {
+    pub nodes_count: usize, // The number of nodes we have
+    pub hashes_count: usize, // The number of info hash we have, max is LRU cache size
+    pub pending_count: usize, // The number of pending info hash to get metadata
+    pub connections_count: usize, // The number of connections we have
 }
 
 pub trait CrawlerController {
@@ -98,7 +105,7 @@ impl Crawler {
         let downloader_config = DownloaderConfig {
             utp_context: utp.clone(),
             peer_id: id,
-            bind_ip: config.ip,
+            bind_ip: None, // We don't process incoming connection
         };
 
         let this = Crawler {
@@ -199,6 +206,16 @@ impl Crawler {
         return self.inner.auto_sample.swap(enable, Ordering::Relaxed);
     }
 
+    /// Get the status of the crawler
+    pub async fn status(&self) -> CrawlerStatus {
+        return CrawlerStatus {
+            nodes_count: self.inner.dht_session.routing_table().await.nodes_len(),
+            hashes_count: self.inner.hash_lru.lock().unwrap().len(),
+            pending_count: self.inner.peer_finder.pending_len(),
+            connections_count: self.inner.downloader.connections(),
+        };
+    }
+
     /// Start the crawler
     pub async fn run(self) {
         tokio::join!(
@@ -285,9 +302,9 @@ impl DhtSessionObserver for CrawlerInner {
 
 #[async_trait]
 impl SamplerObserver for CrawlerInner {
-    async fn on_hash_sampled(&self, hashes: Vec<InfoHash>) {
-        for hash in hashes {
-            if self.has_metadata(hash) {
+    async fn on_hash_sampled(&self, hashes: HashMap<InfoHash, Vec<SocketAddr> >) {
+        for (hash, peers) in hashes {
+            if self.controller.has_metadata(hash) {
                 continue;
             }
             if self.check_hash_lru(hash) { // Not Exist in lru cache?
@@ -296,6 +313,14 @@ impl SamplerObserver for CrawlerInner {
                 self.peer_finder.add_hash(hash);
                 self.downloader.add_hash(hash); // Notify it we may have the incoming peer about this hash
             }
+            // Add all the peers to the downloader
+            for peer in peers {
+                self.downloader.add_peer(hash, peer);
+            }
         }
+    }
+
+    async fn has_metadata(&self, hash: InfoHash) -> bool {
+        return self.controller.has_metadata(hash);
     }
 }

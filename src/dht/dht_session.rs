@@ -398,6 +398,17 @@ impl DhtSession {
         return self.get_peers_impl(queue, hash).await;
     }
 
+    /// Get the peers for the given infohash on the target node, return the peers and the K-nearest nodes
+    #[instrument(skip(self))]
+    pub async fn get_peers_raw(self, ip: SocketAddr, hash: InfoHash) -> Result<GetPeersReply, KrpcError> {
+        let msg = GetPeersQuery {
+            id: self.inner.id,
+            info_hash: hash,
+        };
+        let (reply, _) = self.do_krpc(msg, NodeId::zero(), ip).await;
+        return Ok(reply?);
+    }
+
     /// Ping the nodes for the given ips
     #[instrument(skip(self))]
     pub async fn ping(self, ip: SocketAddr) -> Result<NodeId, KrpcError> {
