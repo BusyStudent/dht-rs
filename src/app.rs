@@ -50,7 +50,9 @@ struct Metadata {
     info_hash: String, // The info hash of the torrent
     name: Option<String>,
     size: Option<String>, // 1 MB or 1.5 GB String
+    tags: Option<Value>,  // The tags of the torrent ['software', 'game', ...]
     files: Option<Value>, // The files in the torrent [{ name: 'ubuntu.iso', size: '4.7 GB' }, { name: 'README.txt', size: '1.2 KB' }]
+    added: Option<String>, // The time when the torrent is added
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -390,26 +392,26 @@ impl App {
         let pattern = search.query;
         let page = search.page.saturating_sub(1); // Page is 1-indexed, to 0-indexed
         let mut items = Vec::new();
-        let info = app.inner.storage.search_torrent(&pattern, (page * MAX_SEARCH_PER_PAGES) as u64, MAX_SEARCH_PER_PAGES as u64)?;
-        for torrent in info.torrents.iter() {
+        let mut info = app.inner.storage.search_torrent(&pattern, (page * MAX_SEARCH_PER_PAGES) as u64, MAX_SEARCH_PER_PAGES as u64)?;
+        for torrent in std::mem::take(&mut info.torrents) {
             let mut files = Vec::new();
 
-            for file in torrent.files.iter() {
+            for file in torrent.files {
                 files.push(json!({
-                    "name": file.name.clone(),
+                    "name": file.name,
                     "size": size_to_string(file.size),
                 }));
             }
 
             items.push(Metadata {
                 info_hash: torrent.hash.hex(),
-                name: Some(torrent.name.clone()),
+                name: Some(torrent.name),
                 size: Some(size_to_string(torrent.size)),
+                tags: Some(json!(torrent.tags)),
                 files: Some(json!(files)),
-            })
+                added: Some(torrent.added),
+            });
         }
-        // Add 
-
         let json = json!({
             "results": items,
             "totalPages": (info.total as usize + MAX_SEARCH_PER_PAGES - 1) / MAX_SEARCH_PER_PAGES,

@@ -84,9 +84,23 @@ impl Torrent {
         }
     }
 
+    /// Get the files of the torrent, filtered the padding files
+    pub fn files_filtered(&self) -> Vec<(String, u64)> {
+        return self.files().into_iter().filter(|(path, _)| {
+            if path.contains("_____padding_file_") || path.contains(".____padding_file_") { // Junk files
+                return false;
+            }
+            return true;
+        }).collect();
+    }
+
     /// Get the torrent object
     pub fn object(&self) -> &Object {
         return &self.data;
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        return self.data.encode();
     }
 
     /// Check version

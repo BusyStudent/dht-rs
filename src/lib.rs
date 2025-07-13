@@ -1,6 +1,7 @@
 pub mod bencode;
 pub mod crawler;
 pub mod storage;
+pub mod tags;
 pub mod core;
 pub mod krpc;
 pub mod dht;

@@ -24,7 +24,7 @@ use std::{
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info};
 
-const MAX_WORKERS: usize = 10;
+const MAX_WORKERS: usize = 100;
 const MAX_CONCURRENT: usize = 10; // Max concurrent downloading for pre each worker
 const MAX_PENDING_PEERS: usize = 100;
 const MAX_DOWNLOAD_TIME: Duration = Duration::from_secs(60);

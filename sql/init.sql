@@ -1,10 +1,31 @@
+CREATE TABLE IF NOT EXISTS `schema_versions` (
+    `version` INTEGER NOT NULL PRIMARY KEY,
+    `name` TEXT NOT NULL,
+    `applied_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS `torrents` (
     `hash` BLOB(20) NOT NULL PRIMARY KEY, 
     `name` TEXT NOT NULL,
     `size` BIGINT NOT NULL,
     `data` BLOB NOT NULL,
-    `files` TEXT NOT NULL,
+    `files` BLOB NOT NULL,
     `added` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS `tags` (
+    `id` INTEGER PRIMARY KEY AUTOINCREMENT,
+    `name` TEXT NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS `torrent_tags` (
+    `torrent_hash` BLOB(20) NOT NULL,
+    `tag_id` INTEGER NOT NULL,
+    
+    PRIMARY KEY (`torrent_hash`, `tag_id`),
+
+    FOREIGN KEY (`torrent_hash`) REFERENCES `torrents`(`hash`) ON DELETE CASCADE,
+    FOREIGN KEY (`tag_id`) REFERENCES `tags`(`id`) ON DELETE CASCADE
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS torrents_fts USING fts5(

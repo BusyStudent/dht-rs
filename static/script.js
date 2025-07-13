@@ -77,11 +77,22 @@ function setupEventListeners() {
     document.getElementById('search-results').addEventListener('click', (e) => {
         const target = e.target;
 
+        // 处理标签删除
+        if (target.classList.contains('tag-delete-btn')) {
+            const hash = target.dataset.hash;
+            const tag = target.dataset.tag;
+            handleTagRemove(hash, tag, target);
+            return;
+        }
+
         // 1. 处理功能按钮点击
         const button = target.closest('button[data-action]');
         if (button) {
             const action = button.dataset.action;
-            const hash = button.dataset.hash;
+            const card = button.closest('.torrent-card');
+            const hash = card ? card.dataset.hash : null;
+
+            if (!hash) return; // Should not happen if button is inside a card
             
             if (action === 'download-torrent') {
                 window.open(`/api/v1/torrents/${hash}`, '_blank');
@@ -89,11 +100,12 @@ function setupEventListeners() {
                 const magnet = `magnet:?xt=urn:btih:${hash}`;
                 navigator.clipboard.writeText(magnet).then(() => alert(`磁力链接已复制: ${magnet}`));
             } else if (action === 'toggle-files') {
-                const fileList = button.closest('.torrent-card').querySelector('.file-list');
+                const fileList = card.querySelector('.file-list');
                 if (fileList) {
-                    // [BUG修复] 改为切换CSS类，而不是直接操作style
                     fileList.classList.toggle('is-shown');
                 }
+            } else if (action === 'add-tag') {
+                showAddTagModal(hash);
             }
             return; // 按钮事件已处理，终止
         }
@@ -139,6 +151,88 @@ function setupEventListeners() {
             handleToolRequest(toolName);
         }
     });
+
+    // --- [新增] 模态窗口事件监听 ---
+    const modal = document.getElementById('add-tag-modal');
+    document.getElementById('modal-cancel-btn').addEventListener('click', hideAddTagModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) { // 点击背景关闭
+            hideAddTagModal();
+        }
+    });
+    document.getElementById('modal-add-btn').addEventListener('click', () => {
+        const hash = document.getElementById('modal-add-btn').dataset.hash;
+        const input = document.getElementById('modal-tag-input');
+        const tag = input.value.trim();
+        if (tag && hash) {
+            handleTagAdd(hash, tag);
+        }
+    });
+}
+
+// --- [新增] 标签模态窗口函数 ---
+function showAddTagModal(hash) {
+    const modal = document.getElementById('add-tag-modal');
+    document.getElementById('modal-info-hash-display').textContent = hash;
+    document.getElementById('modal-add-btn').dataset.hash = hash;
+    modal.style.display = 'flex';
+    document.getElementById('modal-tag-input').focus();
+}
+
+function hideAddTagModal() {
+    const modal = document.getElementById('add-tag-modal');
+    document.getElementById('modal-tag-input').value = '';
+    modal.style.display = 'none';
+}
+
+async function handleTagAdd(hash, tag) {
+    try {
+        const response = await fetch(`/api/v1/metadata/${hash}/tags`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tag: tag })
+        });
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to add tag');
+        }
+        
+        // UI update
+        const card = document.querySelector(`.torrent-card[data-hash="${hash}"]`);
+        if (card) {
+            const tagsContainer = card.querySelector('.tags-container');
+            const newTagHTML = `
+                <span class="tag-item">
+                    ${tag.replace(/</g, "&lt;").replace(/>/g, "&gt;")}
+                    <button class="tag-delete-btn" data-hash="${hash}" data-tag="${tag}">&times;</button>
+                </span>
+            `;
+            tagsContainer.innerHTML += newTagHTML;
+        }
+        hideAddTagModal();
+    } catch (err) {
+        alert(`Error: ${err.message}`);
+    }
+}
+
+async function handleTagRemove(hash, tag, buttonElement) {
+    try {
+        const response = await fetch(`/api/v1/metadata/${hash}/tags`, {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tag: tag })
+        });
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to remove tag');
+        }
+        
+        // UI update
+        buttonElement.parentElement.remove();
+
+    } catch (err) {
+        alert(`Error: ${err.message}`);
+    }
 }
 
 function setupEventSource() {
@@ -455,33 +549,6 @@ async function searchMetadata(page = 1) {
     catch (e) {
         resultsContainer.innerHTML = `<p>搜索失败: ${e}</p>`;
     }
-
-    // console.log(`正在模拟搜索: "${currentQuery}", 第 ${currentPage} 页`);
-    // setTimeout(() => {
-    //      const mockFullData = {
-    //         results: [
-    //             {
-    //                 name: 'ubuntu-22.04.3-desktop-amd64.iso',
-    //                 info_hash: 'f8c0e6e7d4b3a299f1e9a217c5b3f0e8a1c2b3d4',
-    //                 size: '4.7 GB',
-    //                 files: [{ name: 'ubuntu.iso', size: '4.7 GB' }, { name: 'README.txt', size: '1.2 KB' }]
-    //             },
-    //             { // 新增：只有 hash 的情况
-    //                 info_hash: 'aabbccddeeff00112233445566778899aabbccdd'
-    //             },
-    //             {
-    //                 name: '[Tears of Steel] a short film by the Blender Foundation',
-    //                 info_hash: 'd8c0e6e7d4b3a299f1e9a217c5b3f0e8a1c2b3d9',
-    //                 size: '522 MB',
-    //                 files: [{ name: 'Tears of Steel.mp4', size: '520 MB' }, { name: 'poster.jpg', size: '2 MB' }]
-    //             }
-    //         ],
-    //         totalPages: 5,
-    //         currentPage: currentPage
-    //     };
-    //     displaySearchResults(mockFullData.results);
-    //     renderPaginationControls(mockFullData.totalPages, mockFullData.currentPage);
-    // }, 800);
 }
 
 /**
@@ -559,17 +626,25 @@ function displaySearchResults(results) {
         container.innerHTML = '<p>没有找到相关结果。</p>';
         return;
     }
-
+    const addTagButtonHTML = `<button class="button add-tag-button" data-action="add-tag"></button>`;
     results.forEach(item => {
+        const tagsHTML = (item.tags || []).map(tag => `
+            <span class="tag-item">
+                ${tag.replace(/</g, "&lt;").replace(/>/g, "&gt;")}
+                <button class="tag-delete-btn" data-hash="${item.info_hash}" data-tag="${tag}">&times;</button>
+            </span>
+        `).join('');
+
         let cardHTML;
         if (item.name) { // 有完整元数据
             const fileTree = buildFileTree(item.files);
             const fileListHTML = renderTreeToHTML(fileTree);
             // [BUG修复] 移除 file-list 上的内联 style 属性
             cardHTML = `
-                <div class="torrent-card">
+                <div class="torrent-card" data-hash="${item.info_hash}">
                     <h4>${item.name}</h4>
                     <p class="info-hash">Hash: ${item.info_hash}</p>
+                    <div class="tags-container">${tagsHTML}${addTagButtonHTML}</div>
                     <div class="actions">
                         <button class="button" data-action="download-torrent" data-hash="${item.info_hash}">下载种子</button>
                         <button class="button" data-action="copy-magnet" data-hash="${item.info_hash}">复制磁力</button>
@@ -580,7 +655,7 @@ function displaySearchResults(results) {
             `;
         } else { // 只有 info_hash
             cardHTML = `
-                <div class="torrent-card minimal">
+                <div class="torrent-card minimal" data-hash="${item.info_hash}">
                     <h4>元数据待获取</h4>
                     <p class="info-hash">Hash: ${item.info_hash}</p>
                     <div class="actions">

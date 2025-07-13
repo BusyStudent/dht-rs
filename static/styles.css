@@ -260,6 +260,136 @@ label {
     font-size: 14px;
 }
 
+/* --- 标签样式 -- */
+.tags-container {
+    margin-bottom: 15px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center; /* Vertically align tags and button */
+}
+
+.tag-item {
+    background-color: #e0e0e0;
+    color: #333;
+    padding: 0 10px; /* Adjust padding */
+    border-radius: 12px; /* Adjust for new height */
+    font-size: 13px;
+    display: inline-flex;
+    align-items: center;
+    height: 24px; /* Set explicit height */
+    box-sizing: border-box;
+}
+
+.tag-delete-btn {
+    background: none;
+    border: none;
+    color: #999;
+    cursor: pointer;
+    margin-left: 6px;
+    padding: 0;
+    font-size: 16px;
+    line-height: 1;
+}
+
+.tag-delete-btn:hover {
+    color: #e74c3c;
+}
+
+.add-tag-button {
+    background-color: #3498db;
+    color: white;
+    border: none;
+    border-radius: 50%; /* Make it a circle */
+    cursor: pointer;
+    width: 24px; /* Match tag height */
+    height: 24px; /* Match tag height */
+    transition: background-color 0.2s;
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0; /* Prevent shrinking */
+}
+
+.add-tag-button::before,
+.add-tag-button::after {
+    content: '';
+    position: absolute;
+    background-color: white;
+    transition: transform 0.2s ease-out;
+}
+
+.add-tag-button::before {
+    width: 12px; /* Horizontal bar */
+    height: 2px;
+}
+
+.add-tag-button::after {
+    width: 2px; /* Vertical bar */
+    height: 12px;
+}
+
+.add-tag-button:hover {
+    background-color: #2980b9;
+}
+
+.add-tag-button:hover::before {
+    transform: rotate(180deg);
+}
+
+.add-tag-button:hover::after {
+    transform: rotate(180deg);
+}
+
+/* --- [新增] 模态窗口样式 --- */
+.modal-backdrop {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.6);
+    display: none; /* 默认隐藏 */
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+}
+
+.modal-content {
+    background-color: #fff;
+    padding: 25px;
+    border-radius: 8px;
+    box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+    width: 90%;
+    max-width: 450px;
+    animation: modal-fade-in 0.3s ease-out;
+}
+
+@keyframes modal-fade-in {
+    from { opacity: 0; transform: translateY(-20px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+.modal-content h3 {
+    margin-top: 0;
+    margin-bottom: 10px;
+}
+
+.modal-content p {
+    margin-top: 0;
+    margin-bottom: 20px;
+    color: #555;
+    word-break: break-all;
+}
+
+.modal-actions {
+    margin-top: 20px;
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+}
+
 /* --- 文件树状列表样式 --- */
 .file-list {
     display: none; /* 默认隐藏 */
