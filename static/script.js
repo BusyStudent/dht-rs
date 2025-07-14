@@ -7,6 +7,8 @@ let routingTableTimer;   // 用于更新路由表的计时器
 let dashboardTimer;      // 用于更新仪表盘的计时器
 let currentQuery = '';   // 当前搜索的关键词
 let currentPage = 1;     // 当前搜索的页码
+let allTags = [];        // [新增] 用于存储所有标签，用于自动补全
+let areTagsFetched = false; // [新增] 标记是否已获取过所有标签
 
 // [新增] 模块化仪表盘状态管理
 const dashboard = {
@@ -154,6 +156,8 @@ function setupEventListeners() {
 
     // --- [新增] 模态窗口事件监听 ---
     const modal = document.getElementById('add-tag-modal');
+    const tagInput = document.getElementById('modal-tag-input');
+
     document.getElementById('modal-cancel-btn').addEventListener('click', hideAddTagModal);
     modal.addEventListener('click', (e) => {
         if (e.target === modal) { // 点击背景关闭
@@ -162,16 +166,102 @@ function setupEventListeners() {
     });
     document.getElementById('modal-add-btn').addEventListener('click', () => {
         const hash = document.getElementById('modal-add-btn').dataset.hash;
-        const input = document.getElementById('modal-tag-input');
-        const tag = input.value.trim();
+        const tag = tagInput.value.trim();
         if (tag && hash) {
             handleTagAdd(hash, tag);
         }
     });
+
+    // [新增] 标签输入自动补全事件
+    tagInput.addEventListener('input', handleTagInput);
+    tagInput.addEventListener('keydown', handleTagSuggestionKeyDown);
 }
 
-// --- [新增] 标签模态窗口函数 ---
+// --- [新增] 标签模态窗口与自动补全 ---
+
+async function fetchAllTags() {
+    if (areTagsFetched) return;
+    try {
+        const response = await fetch('/api/v1/metadata/all_tags');
+        const data = await response.json();
+        if (data.tags) {
+            allTags = data.tags;
+            areTagsFetched = true;
+        }
+    } catch (error) {
+        console.error('Failed to fetch all tags:', error);
+        // 如果获取失败，下次打开模态窗口时可以重试
+        areTagsFetched = false; 
+    }
+}
+
+function handleTagInput(e) {
+    const input = e.target.value.toLowerCase();
+    const suggestionsContainer = document.getElementById('tag-suggestions');
+    
+    if (!input) {
+        suggestionsContainer.style.display = 'none';
+        return;
+    }
+
+    const filteredTags = allTags.filter(tag => tag.toLowerCase().includes(input));
+    
+    if (filteredTags.length > 0) {
+        suggestionsContainer.innerHTML = filteredTags
+            .map(tag => `<div class="suggestion-item">${tag}</div>`)
+            .join('');
+        suggestionsContainer.style.display = 'block';
+
+        // 为每个建议项添加点击事件
+        suggestionsContainer.querySelectorAll('.suggestion-item').forEach(item => {
+            item.addEventListener('click', () => {
+                document.getElementById('modal-tag-input').value = item.textContent;
+                suggestionsContainer.style.display = 'none';
+            });
+        });
+    } else {
+        suggestionsContainer.style.display = 'none';
+    }
+}
+
+function handleTagSuggestionKeyDown(e) {
+    const suggestionsContainer = document.getElementById('tag-suggestions');
+    if (suggestionsContainer.style.display === 'none') return;
+
+    const items = suggestionsContainer.querySelectorAll('.suggestion-item');
+    let activeItem = suggestionsContainer.querySelector('.suggestion-item.active');
+    let activeIndex = Array.from(items).indexOf(activeItem);
+
+    if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (activeItem) {
+            activeItem.classList.remove('active');
+        }
+        activeIndex = (activeIndex + 1) % items.length;
+        items[activeIndex].classList.add('active');
+    } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (activeItem) {
+            activeItem.classList.remove('active');
+        }
+        activeIndex = (activeIndex - 1 + items.length) % items.length;
+        items[activeIndex].classList.add('active');
+    } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (activeItem) {
+            document.getElementById('modal-tag-input').value = activeItem.textContent;
+            suggestionsContainer.style.display = 'none';
+        }
+    } else if (e.key === 'Escape') {
+        suggestionsContainer.style.display = 'none';
+    }
+}
+
+
 function showAddTagModal(hash) {
+    // 获取所有标签用于自动补全
+    fetchAllTags(); 
+
     const modal = document.getElementById('add-tag-modal');
     document.getElementById('modal-info-hash-display').textContent = hash;
     document.getElementById('modal-add-btn').dataset.hash = hash;
@@ -182,32 +272,41 @@ function showAddTagModal(hash) {
 function hideAddTagModal() {
     const modal = document.getElementById('add-tag-modal');
     document.getElementById('modal-tag-input').value = '';
+    // [新增] 隐藏建议框
+    document.getElementById('tag-suggestions').style.display = 'none'; 
     modal.style.display = 'none';
 }
 
 async function handleTagAdd(hash, tag) {
     try {
-        const response = await fetch(`/api/v1/metadata/${hash}/tags`, {
+        const response = await fetch(`/api/v1/metadata/add_tag`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ tag: tag })
+            body: JSON.stringify({ tag: tag, hash: hash })
         });
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || 'Failed to add tag');
+        const json = await response.json();
+        if (json.error != null) {
+            throw new Error(json.error);
         }
         
         // UI update
         const card = document.querySelector(`.torrent-card[data-hash="${hash}"]`);
         if (card) {
             const tagsContainer = card.querySelector('.tags-container');
+            const addButton = tagsContainer.querySelector('.add-tag-button');
             const newTagHTML = `
                 <span class="tag-item">
                     ${tag.replace(/</g, "&lt;").replace(/>/g, "&gt;")}
                     <button class="tag-delete-btn" data-hash="${hash}" data-tag="${tag}">&times;</button>
                 </span>
             `;
-            tagsContainer.innerHTML += newTagHTML;
+            if (addButton) {
+                addButton.insertAdjacentHTML('beforebegin', newTagHTML);
+            }
+            else {
+                // Fallback, though the button should always be there.
+                tagsContainer.innerHTML += newTagHTML;
+            }
         }
         hideAddTagModal();
     } catch (err) {
@@ -217,14 +316,14 @@ async function handleTagAdd(hash, tag) {
 
 async function handleTagRemove(hash, tag, buttonElement) {
     try {
-        const response = await fetch(`/api/v1/metadata/${hash}/tags`, {
-            method: 'DELETE',
+        const response = await fetch(`/api/v1/metadata/remove_tag`, {
+            method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ tag: tag })
+            body: JSON.stringify({ tag: tag, hash: hash })
         });
-        if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.error || 'Failed to remove tag');
+        const json = await response.json();
+        if (json.error != null) {
+            throw new Error(json.error);
         }
         
         // UI update
@@ -530,7 +629,7 @@ async function searchMetadata(page = 1) {
     renderPaginationControls(0, 0); // 清空旧的翻页
 
     try {
-        const response = await fetch('/api/v1/search_metadata', {
+        const response = await fetch('/api/v1/metadata/search', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ query: currentQuery, page: currentPage })

@@ -195,7 +195,10 @@
         <div class="modal-content">
             <h3>添加新标签</h3>
             <p>为 <strong id="modal-info-hash-display"></strong></p>
-            <input type="text" id="modal-tag-input" placeholder="输入标签名称...">
+            <div class="input-with-suggestions">
+                <input type="text" id="modal-tag-input" placeholder="输入标签名称..." autocomplete="off">
+                <div id="tag-suggestions" class="suggestions-container"></div>
+            </div>
             <div class="modal-actions">
                 <button id="modal-cancel-btn" class="button danger">取消</button>
                 <button id="modal-add-btn" class="button">确认添加</button>

@@ -140,7 +140,13 @@ impl PeerFinder {
 
     #[instrument(skip(self))]
     async fn find_peers(self, hash: InfoHash) {
+        let mut first_time = true;
         for _ in 0..self.inner.max_retries {
+            if !first_time {
+                info!("Finished finding peers for {}, sleeping for 15 minutes", hash);
+                // Next find_peers in 15 minutes
+                time::sleep(time::Duration::from_secs(15 * 60)).await;
+            }
             let premit = match self.inner.sem.acquire().await {
                 Ok(p) => p,
                 Err(_) => return, // May not happend
@@ -155,9 +161,7 @@ impl PeerFinder {
             }
 
             drop(premit);
-            info!("Finished finding peers for {}, sleeping for 15 minutes", hash);
-            // Next find_peers in 15 minutes
-            time::sleep(time::Duration::from_secs(15 * 60)).await;
+            first_time = false;
         }
         // Remove the task from the pending map
         let mut map = self.inner.pending.lock().unwrap();

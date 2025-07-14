@@ -97,7 +97,7 @@ impl Crawler {
             dht_session: session.clone(),
             udp_socket: udp.clone(),
             max_concurrent: 20, // 5 may be too small, use 20?
-            max_retries: 2,
+            max_retries: 1,
             bind_ip: config.ip,
             peer_id: id,
         };

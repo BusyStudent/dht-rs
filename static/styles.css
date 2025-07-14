@@ -383,6 +383,36 @@ label {
     word-break: break-all;
 }
 
+/* [新增] 自动补全容器样式 */
+.input-with-suggestions {
+    position: relative;
+}
+
+.suggestions-container {
+    display: none; /* 默认隐藏 */
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    background-color: #fff;
+    border: 1px solid #ccc;
+    border-top: none;
+    border-radius: 0 0 4px 4px;
+    max-height: 150px;
+    overflow-y: auto;
+    z-index: 1001; /* 比模态窗口高一级 */
+}
+
+.suggestion-item {
+    padding: 10px;
+    cursor: pointer;
+}
+
+.suggestion-item:hover, .suggestion-item.active {
+    background-color: #f0f0f0;
+}
+
+
 .modal-actions {
     margin-top: 20px;
     display: flex;

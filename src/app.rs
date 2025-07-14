@@ -196,7 +196,10 @@ impl App {
             .route("/api/v1/tools/{*tool}", post(App::tools_handler))
 
             // Search
-            .route("/api/v1/search_metadata", post(App::search_metadata_handler))
+            .route("/api/v1/metadata/search", post(App::search_metadata_handler))
+            .route("/api/v1/metadata/add_tag", post(App::add_tag_handler))
+            .route("/api/v1/metadata/remove_tag", post(App::remove_tag_handler))
+            .route("/api/v1/metadata/all_tags", get(App::all_tags_handler))
             .route("/api/v1/torrents/{*info_hash}", get(App::get_torrent_handler))
 
             // Config...
@@ -429,17 +432,73 @@ impl App {
         }
     }
 
-    async fn get_torrent_handler(State(app): State<App>, Path(hash): Path<String>) -> impl IntoResponse {
-        let torrent = match InfoHash::from_hex(&hash) {
-            None => return Err(StatusCode::BAD_REQUEST),
-            Some(hash) => {
-                app.inner.storage.get_torrent(hash).ok()
-            }
+    async fn add_tag_handler(State(app): State<App>, extract::Json(json): extract::Json<Value>) -> impl IntoResponse {
+        let hash = json["hash"].as_str().and_then(|hex| InfoHash::from_hex(hex));
+        let tag = json["tag"].as_str().map(|t| t.trim());
+
+        let (hash, tag) = match (hash, tag) {
+            (Some(hash), Some(tag)) => (hash, tag),
+            _ => return Json(json!({
+                "error": "Missing hash or tag in json"
+            })),
         };
+        if tag.is_empty() {
+            return Json(json!({
+                "error": "Tag is empty"
+            }));
+        };
+
+        if let Ok(_) = app.inner.storage.add_torrent_tag(hash, tag) {
+            return Json(json!({
+                "success": true
+            }));
+        }
+        return Json(json!({
+            "error": "Error to add tag"
+        }));
+    }
+
+    async fn remove_tag_handler(State(app): State<App>, extract::Json(json): extract::Json<Value>) -> impl IntoResponse {
+        let hash = json["hash"].as_str().and_then(|hex| InfoHash::from_hex(hex));
+        let tag = json["tag"].as_str();
+
+        let (hash, tag) = match (hash, tag) {
+            (Some(hash), Some(tag)) => (hash, tag),
+            _ => return Json(json!({
+                "error": "Missing hash or tag in json"
+            })),
+        };
+
+        if let Ok(_) = app.inner.storage.remove_torrent_tag(hash, tag) {
+            return Json(json!({
+                "success": true
+            }));
+        }
+
+        return Json(json!({
+            "error": "Error to remove tag"
+        }));
+    }
+
+    async fn all_tags_handler(State(app): State<App>) -> impl IntoResponse {
+        let tags = match app.inner.storage.all_tags() {
+            Ok(val) => val,
+            Err(e) => return Json(json!({
+                "error": e.to_string()
+            })),
+        };
+        return Json(json!({
+            "tags": tags
+        }));
+    }
+
+    async fn get_torrent_handler(State(app): State<App>, Path(hash): Path<InfoHash>) -> impl IntoResponse {
+        let torrent = app.inner.storage.get_torrent(hash).ok();
         // Build the reply
-        if let Some(data) = torrent {
+        if let Some((name, data)) = torrent {
             let mut header = HeaderMap::new();
             header.insert("Content-Type", "application/octet-stream".parse().unwrap());
+            header.insert("Content-Disposition", format!("attachment; filename=\"{}.torrent\"", name).parse().unwrap());
 
             return Ok((header, data));
         }

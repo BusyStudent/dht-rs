@@ -52,6 +52,7 @@ impl Storage {
         return Ok(db);
     }
 
+    /// Add a torrent to the database
     pub fn add_torrent(&self, torrent: &Torrent) -> Result<()> {
         let hash = torrent.info_hash();
         let name = torrent.name();
@@ -88,17 +89,38 @@ impl Storage {
         return Ok(());
     }
 
-    /// Get the torrent data from the database
-    pub fn get_torrent(&self, hash: InfoHash) -> Result<Vec<u8> > {
+    /// Add a tag to a torrent
+    /// 
+    /// `tag` must be non-empty
+    pub fn add_torrent_tag(&self, hash: InfoHash, tag: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        Self::add_tag_impl(&transaction, hash, tag)?;
+        transaction.commit()?;
+        return Ok(());
+    }
+
+    /// Remove a tag from a torrent
+    pub fn remove_torrent_tag(&self, hash: InfoHash, tag: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT data FROM torrents WHERE hash = ?1")?;
+        let mut stmt = conn.prepare("DELETE FROM torrent_tags WHERE torrent_hash = ?1 AND tag_id = (SELECT id FROM tags WHERE name = ?2)")?;
+        stmt.execute(params![hash.as_slice(), tag])?;
+
+        return Ok(());
+    }
+
+    /// Get the torrent data from the database
+    pub fn get_torrent(&self, hash: InfoHash) -> Result<(String, Vec<u8>)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT name, data FROM torrents WHERE hash = ?1")?;
         let mut rows = stmt.query(params![hash.as_slice()])?;
         let row = rows.next()?.unwrap();
-        let data: Vec<u8> = row.get(0)?;
+        let name: String = row.get(0)?;
+        let data: Vec<u8> = row.get(1)?;
 
         // Decompress the data
         let decompressed = zstd::decode_all(data.as_slice()).unwrap();
-        return Ok(decompressed);
+        return Ok((name, decompressed));
     }
 
     /// Check if the torrent is already in the database
@@ -271,15 +293,22 @@ impl Storage {
             .map(|t| t.trim())
             .filter(|t| !t.is_empty()) 
         {
-            t.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", params![tag])?;
-
-            // Get the tag id
-            let tag_id: i64 = t.query_row("SELECT id FROM tags WHERE name = ?1", params![tag], |row| row.get(0))?;
-
-            // Insert the tag into the torrent_tags table
-            t.execute("INSERT OR IGNORE INTO torrent_tags (torrent_hash, tag_id) VALUES (?1, ?2)", params![hash.as_slice(), tag_id])?;
+            Self::add_tag_impl(t, hash, tag)?;
         }
 
+        return Ok(());
+    }
+
+    /// Do the actual work of adding a tag to the database
+    fn add_tag_impl(t: &Transaction, hash: InfoHash, tag: &str) -> Result<()> {
+        debug_assert!(!tag.is_empty(), "Tag cannot be empty");
+        t.execute("INSERT OR IGNORE INTO tags (name) VALUES (?1)", params![tag])?;
+
+        // Get the tag id
+        let tag_id: i64 = t.query_row("SELECT id FROM tags WHERE name = ?1", params![tag], |row| row.get(0))?;
+
+        // Insert the tag into the torrent_tags table
+        t.execute("INSERT OR IGNORE INTO torrent_tags (torrent_hash, tag_id) VALUES (?1, ?2)", params![hash.as_slice(), tag_id])?;
         return Ok(());
     }
 
@@ -340,7 +369,7 @@ mod tests {
         torrents.truncate(50); // Max 50 torrents
 
         for hash in torrents {
-            let bytes = storage.get_torrent(hash).unwrap();
+            let (_, bytes) = storage.get_torrent(hash).unwrap();
             let torrent = Torrent::from_bytes(&bytes).unwrap();
 
             let files: Vec<TorrentFile> = torrent.files_filtered().into_iter().map(|(name, size)| TorrentFile {
